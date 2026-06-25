@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""ctx-lx-reverse-poller — Lingxiaodian side of the reverse (HGS->LX) transport.
+
+FRP-first, pull model. The remote peer never connects outbound to the ledger
+host. This poller is the only mover, and it reuses a configured reverse-SSH
+tunnel. Every cycle:
+
+  PULL : ssh mac `ls ~/ctx-pi/lx-inbox/*.task.json` -> for each, cat the envelope,
+         write it atomically into the local inbox,
+         then DELETE the Mac copy (cleanup option 甲). worker-LX picks it up.
+
+  PUSH : for each reply produced by worker-LX in the local outbox, ship it to
+         the Mac `~/ctx-pi/lx-outbox/<rid>.reply.json` (atomic tmp+mv), then move
+         the local reply into outbox-done.
+
+Idempotency: option 甲 deletes the Mac task right after the LX inbox file is
+durably written. If the poller dies between write and delete, the next pull
+re-writes the same route_id envelope; worker-LX's terminal-status guard prevents
+double execution. Cleanup of the ledger stays 100% on Lingxiaodian.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+def default_pi_home() -> Path:
+    state_home = os.environ.get("XDG_STATE_HOME")
+    if state_home:
+        return Path(state_home) / "asc-context-engine" / "pi"
+    return Path.cwd() / "ctx-pi"
+
+
+BASE = Path(os.environ.get("CTX_LX_HOME") or default_pi_home())
+INBOX = BASE / "inbox"
+OUTBOX = BASE / "outbox"
+OUTBOX_DONE = BASE / "outbox-done"
+FRP_HOST = os.environ.get("CTX_HGS_FRP_HOST", "127.0.0.1")
+FRP_PORT = os.environ.get("CTX_HGS_FRP_PORT", "6022")
+FRP_USER = os.environ.get("CTX_HGS_FRP_USER", "ctx")
+FRP_CONFIG = os.environ.get("CTX_HGS_FRP_SSH_CONFIG", "/dev/null")
+REMOTE = os.environ.get("CTX_HGS_PI_HOME", "ctx-pi")
+R_INBOX = f"{REMOTE}/lx-inbox"
+R_OUTBOX = f"{REMOTE}/lx-outbox"
+
+
+def now() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def ensure_dirs() -> None:
+    for d in (INBOX, OUTBOX, OUTBOX_DONE):
+        d.mkdir(parents=True, exist_ok=True)
+
+
+def ssh(remote_cmd: str, stdin: str | None = None, timeout: int = 20) -> subprocess.CompletedProcess:
+    cmd = ["ssh", "-F", FRP_CONFIG, "-p", FRP_PORT,
+           "-o", "BatchMode=yes", "-o", "ConnectTimeout=6",
+           f"{FRP_USER}@{FRP_HOST}", remote_cmd]
+    return subprocess.run(cmd, input=stdin, text=True, capture_output=True, timeout=timeout)
+
+
+def ensure_remote_dirs() -> None:
+    r = ssh(f"mkdir -p {R_INBOX} {R_OUTBOX} && echo ok")
+    if "ok" not in (r.stdout or ""):
+        raise RuntimeError(f"remote dirs failed: {r.stderr.strip() or r.stdout.strip()}")
+
+
+def atomic_write(path: Path, text: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def pull_cycle() -> int:
+    r = ssh(f"ls {R_INBOX}/*.task.json 2>/dev/null || true")
+    names = [line.strip() for line in (r.stdout or "").splitlines() if line.strip()]
+    pulled = 0
+    for remote_path in names:
+        base = os.path.basename(remote_path)
+        got = ssh(f"cat {shlex.quote(remote_path)} 2>/dev/null || true")
+        body = (got.stdout or "").strip()
+        if not body:
+            continue
+        try:
+            json.loads(body)  # validate before accepting
+        except json.JSONDecodeError:
+            print(f"[{now()}] skip non-JSON {base}", file=sys.stderr)
+            continue
+        atomic_write(INBOX / base, body)            # durable on LX first
+        ssh(f"rm -f {shlex.quote(remote_path)}")    # cleanup option 甲
+        pulled += 1
+        print(f"[{now()}] pulled reverse task {base} -> LX inbox")
+    return pulled
+
+
+def push_cycle() -> int:
+    pushed = 0
+    for reply in sorted(OUTBOX.glob("*.reply.json")):
+        body = reply.read_text(encoding="utf-8")
+        name = reply.name
+        r = ssh(f"cat > {R_OUTBOX}/{name}.tmp && mv -f {R_OUTBOX}/{name}.tmp {R_OUTBOX}/{name} && echo ok",
+                stdin=body)
+        if "ok" in (r.stdout or ""):
+            os.replace(reply, OUTBOX_DONE / name)
+            pushed += 1
+            print(f"[{now()}] pushed reply {name} -> Mac lx-outbox")
+        else:
+            print(f"[{now()}] push failed {name}: {r.stderr.strip() or r.stdout.strip()}", file=sys.stderr)
+    return pushed
+
+
+def cycle() -> tuple[int, int]:
+    ensure_remote_dirs()
+    return pull_cycle(), push_cycle()
+
+
+UNREACHABLE_MARKERS = (
+    "connection refused", "connection timed out", "operation timed out",
+    "connection closed", "could not resolve", "no route to host",
+    "timed out", "broken pipe", "connection reset",
+)
+
+
+def is_unreachable_error(exc: Exception) -> bool:
+    """True when the failure means 'the Mac / FRP tunnel is offline' rather than a bug."""
+    s = str(exc).lower()
+    return any(m in s for m in UNREACHABLE_MARKERS)
+
+
+def human_dt(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+
+
+def run_loop(interval: float, cap: float = 60.0) -> int:
+    """Main poll loop with transition-only logging + exponential backoff while offline.
+
+    Healthy/online: poll every `interval`s; pull/push events log themselves.
+    Offline (Mac asleep / tunnel down): log ONCE on the down transition, then stay
+    quiet and back off (interval -> 2x -> ... -> cap) instead of flooding one identical
+    'Connection refused' line every cycle. Log ONCE again on recovery with the outage
+    duration and how many retries were suppressed.
+    """
+    print(f"[{now()}] ctx-lx-reverse-poller loop interval={interval}s cap={cap}s FRP {FRP_HOST}:{FRP_PORT}")
+    down_since: float | None = None
+    suppressed = 0
+    backoff = interval
+    while True:
+        sleep_for = interval
+        try:
+            cycle()
+            if down_since is not None:
+                outage = time.monotonic() - down_since
+                print(f"[{now()}] FRP tunnel RECOVERED after {human_dt(outage)} "
+                      f"({suppressed} retries suppressed while offline)")
+                down_since, suppressed, backoff = None, 0, interval
+        except Exception as exc:
+            if is_unreachable_error(exc):
+                if down_since is None:
+                    down_since = time.monotonic()
+                    suppressed = 0
+                    print(f"[{now()}] FRP tunnel DOWN (Huaguoshan unreachable): "
+                          f"{str(exc).splitlines()[-1][:120]}. Backing off quietly until recovery.")
+                else:
+                    suppressed += 1
+                backoff = min(cap, max(interval, backoff) * 2)
+                sleep_for = backoff
+            else:
+                # genuine unexpected error: always log (rare, important)
+                print(f"[{now()}] cycle error: {exc}", file=sys.stderr)
+        time.sleep(sleep_for)
+
+
+def main() -> int:
+    # line-buffer stdout/stderr so transition logs land promptly under systemd (non-TTY)
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+    ensure_dirs()
+    p = argparse.ArgumentParser(prog="ctx-lx-reverse-poller")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("once")
+    lp = sub.add_parser("loop"); lp.add_argument("--interval", type=float, default=5.0)
+    sub.add_parser("doctor")
+    args = p.parse_args()
+    if args.cmd == "doctor":
+        try:
+            ensure_remote_dirs()
+            r = ssh(f"echo host=$(hostname); echo lx_inbox=$(ls {R_INBOX} 2>/dev/null | wc -l)")
+            print(json.dumps({"reachable": True, "transport": f"frp-reverse-ssh:{FRP_HOST}:{FRP_PORT}",
+                              "remote": (r.stdout or '').strip().replace('\n', ' ')},
+                             ensure_ascii=False, indent=2))
+        except Exception as exc:
+            print(json.dumps({"reachable": False, "error": str(exc)}, ensure_ascii=False)); return 1
+        return 0
+    if args.cmd == "once":
+        pulled, pushed = cycle()
+        print(f"pulled={pulled} pushed={pushed}"); return 0
+    return run_loop(args.interval)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

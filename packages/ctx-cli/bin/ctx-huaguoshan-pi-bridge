@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""ctx-huaguoshan-pi-bridge — Lingxiaodian side of the pi<->pi CTX path.
+
+FRP-first. Every CTX ledger operation runs locally on Lingxiaodian. This bridge:
+
+  1. claims a route on behalf of the Huaguoshan pi worker (proxy claim),
+  2. pushes a task envelope into the Mac's ~/ctx-pi/inbox over the existing FRP
+     reverse SSH (127.0.0.1:6022, HOME dir only — no public SSH, no TCC volume),
+  3. polls the Mac's ~/ctx-pi/outbox for the worker's reply,
+  4. writes that reply back into the CTX ledger via ctx-route.
+
+The Mac side is ctx-pi-worker, which runs `pi -p` in the human's interactive
+pi context and is otherwise ledger/network-agnostic.
+
+Usage:
+    ctx-huaguoshan-pi-bridge dispatch \
+        --title "..." --prompt "do X on Huaguoshan" [--cwd ~] [--timeout 600] \
+        [--wait 300] [--verify]
+
+    ctx-huaguoshan-pi-bridge run --route-id <id> [--wait 300] [--verify]
+    ctx-huaguoshan-pi-bridge collect --route-id <id>
+    ctx-huaguoshan-pi-bridge remote-doctor
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ROUTE_CTL = os.environ.get("CTX_ROUTE", os.path.join(SCRIPT_DIR, "ctx-route"))
+FRP_HOST = os.environ.get("CTX_HGS_FRP_HOST", "127.0.0.1")
+FRP_PORT = os.environ.get("CTX_HGS_FRP_PORT", "6022")
+FRP_USER = os.environ.get("CTX_HGS_FRP_USER", "ctx")
+FRP_CONFIG = os.environ.get("CTX_HGS_FRP_SSH_CONFIG", "/dev/null")
+REMOTE_BASE = os.environ.get("CTX_HGS_PI_HOME", "ctx-pi")  # relative to $HOME on Mac
+DEVICE = "huaguoshan-macos"
+WORKER_AGENT = "huaguoshan-macos:pi"
+BRIDGE_AGENT = "lingxiaodian:pi-bridge"
+INSTANCE = f"{socket.gethostname()}:{os.getpid()}:{dt.datetime.now(dt.timezone.utc):%Y%m%dT%H%M%SZ}"
+
+
+def now() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+# ---------------------------------------------------------------- ledger (local)
+def route_cmd(args: list[str], stdin: str | None = None, timeout: int = 30) -> object:
+    r = subprocess.run([ROUTE_CTL, *args], input=stdin, text=True,
+                       capture_output=True, timeout=timeout)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout or "ctx-route failed").strip())
+    out = (r.stdout or "").strip()
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return out
+
+
+def route_show(rid: str) -> dict:
+    d = route_cmd(["show", rid])
+    return d if isinstance(d, dict) else {}
+
+
+def route_lease_args(rid: str) -> list[str]:
+    route = route_show(rid)
+    lease = route.get("lease") if isinstance(route.get("lease"), dict) else {}
+    args = ["--agent-id", lease.get("claimed_by") or WORKER_AGENT]
+    if lease.get("claim_instance_id"):
+        args.extend(["--instance-id", str(lease["claim_instance_id"])])
+    if lease.get("lease_id"):
+        args.extend(["--lease-id", str(lease["lease_id"])])
+    return args
+
+
+# ----------------------------------------------------------------- FRP transport
+def ssh_base() -> list[str]:
+    return ["ssh", "-F", FRP_CONFIG, "-p", FRP_PORT,
+            "-o", "BatchMode=yes", "-o", "ConnectTimeout=6",
+            f"{FRP_USER}@{FRP_HOST}"]
+
+
+def ssh_run(remote_cmd: str, stdin: str | None = None, timeout: int = 20) -> subprocess.CompletedProcess:
+    return subprocess.run(ssh_base() + [remote_cmd], input=stdin, text=True,
+                          capture_output=True, timeout=timeout)
+
+
+def ensure_remote_dirs() -> None:
+    r = ssh_run(f"mkdir -p {REMOTE_BASE}/inbox {REMOTE_BASE}/outbox {REMOTE_BASE}/done {REMOTE_BASE}/logs && echo ok")
+    if r.returncode != 0 or "ok" not in (r.stdout or ""):
+        raise RuntimeError(f"cannot prepare remote dirs: {r.stderr.strip() or r.stdout.strip()}")
+
+
+def push_task(rid: str, envelope: dict) -> None:
+    ensure_remote_dirs()
+    payload = json.dumps(envelope, ensure_ascii=False)
+    # atomic: write to .tmp then mv into inbox
+    r = ssh_run(f"cat > {REMOTE_BASE}/inbox/{rid}.task.json.tmp && "
+                f"mv {REMOTE_BASE}/inbox/{rid}.task.json.tmp {REMOTE_BASE}/inbox/{rid}.task.json && echo pushed",
+                stdin=payload)
+    if r.returncode != 0 or "pushed" not in (r.stdout or ""):
+        raise RuntimeError(f"task push failed: {r.stderr.strip() or r.stdout.strip()}")
+
+
+def pull_reply(rid: str) -> dict | None:
+    r = ssh_run(f"cat {REMOTE_BASE}/outbox/{rid}.reply.json 2>/dev/null || true")
+    body = (r.stdout or "").strip()
+    if not body:
+        return None
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError:
+        return None
+
+
+def cleanup_remote(rid: str) -> None:
+    ssh_run(f"rm -f {REMOTE_BASE}/outbox/{rid}.reply.json")
+
+
+# ----------------------------------------------------------------- orchestration
+def claim_and_start(rid: str) -> None:
+    claim = route_cmd(["claim", rid, "--device-id", DEVICE, "--agent-id", WORKER_AGENT,
+                       "--instance-id", INSTANCE, "--lease-seconds", "1200"])
+    lease_id = claim.get("lease_id") if isinstance(claim, dict) else None
+    start_args = ["start", rid, "--agent-id", WORKER_AGENT, "--instance-id", INSTANCE]
+    if lease_id:
+        start_args.extend(["--lease-id", str(lease_id)])
+    route_cmd(start_args)
+
+
+def build_envelope(route: dict) -> dict:
+    prompt = route.get("instructions") or route.get("title_original") or ""
+    return {
+        "schema": "ctx-pi-task-v1",
+        "route_id": route["route_id"],
+        "trace_id": route.get("trace_id"),
+        "lane_id": route.get("lane_id") or route.get("work_chat_id") or route.get("context_id") or route.get("trace_id") or route.get("route_id"),
+        "work_chat_id": route.get("work_chat_id"),
+        "context_id": route.get("context_id"),
+        "origin": f"{route.get('origin_site', 'lingxiaodian')}:{route.get('origin_agent', 'fable')}",
+        "prompt": prompt,
+        "constraints": route.get("constraints") or [],
+        "cwd": route.get("cwd") or "~",
+        "timeout_seconds": int(route.get("timeout_seconds") or 600),
+        "pi_args": route.get("pi_args") or [],
+        "pushed_at": now(),
+    }
+
+
+def submit_reply(rid: str, worker_reply: dict) -> None:
+    status = worker_reply.get("status", "replied")
+    if status not in ("replied", "failed", "blocked", "needs_approval"):
+        status = "replied"
+    ledger_reply = {
+        "route_id": rid,
+        "status": status,
+        "replied_at": worker_reply.get("replied_at") or now(),
+        "executed_by": worker_reply.get("executed_by", WORKER_AGENT),
+        "summary": worker_reply.get("summary", "Huaguoshan pi reply"),
+        "evidence": (worker_reply.get("evidence") or []) + [
+            {"kind": "transport", "value": f"frp-reverse-ssh:{FRP_HOST}:{FRP_PORT}; HOME file-drop"},
+        ],
+        "artifacts": worker_reply.get("artifacts") or [],
+        "secret_events": worker_reply.get("secret_events") or [],
+        "residual_risk": worker_reply.get("residual_risk",
+                                          "Huaguoshan pi reply not independently re-verified."),
+        "next_action": worker_reply.get("next_action", "verify"),
+    }
+    route_cmd(["reply", rid, "--reply-file", "-", *route_lease_args(rid)],
+              stdin=json.dumps(ledger_reply, ensure_ascii=False))
+
+
+def wait_for_reply(rid: str, wait_s: int, poll: float = 3.0) -> dict | None:
+    deadline = time.monotonic() + wait_s
+    while time.monotonic() < deadline:
+        reply = pull_reply(rid)
+        if reply:
+            return reply
+        time.sleep(poll)
+    return pull_reply(rid)
+
+
+def do_run(rid: str, wait_s: int, verify: bool) -> int:
+    route = route_show(rid)
+    if not route:
+        print(f"route not found: {rid}", file=sys.stderr)
+        return 2
+    if route.get("status") == "queued":
+        claim_and_start(rid)
+        route = route_show(rid)
+    envelope = build_envelope(route)
+    print(f"[{now()}] pushing task {rid} to Huaguoshan inbox over FRP")
+    push_task(rid, envelope)
+    print(f"[{now()}] waiting up to {wait_s}s for Huaguoshan pi reply…")
+    reply = wait_for_reply(rid, wait_s)
+    if not reply:
+        print(f"[{now()}] no reply yet; route left running. Re-run `collect --route-id {rid}` later.")
+        return 3
+    submit_reply(rid, reply)
+    cleanup_remote(rid)
+    print(f"[{now()}] reply written to ledger: status={reply.get('status')} summary={reply.get('summary','')[:120]}")
+    if verify and reply.get("status") == "replied":
+        route_cmd(["verify", rid, "--verdict", "accepted", "--verified-by", "lingxiaodian:fable",
+                   "--summary", f"pi<->pi route accepted: {reply.get('summary','')[:160]}"])
+        print(f"[{now()}] route {rid} verified accepted")
+    return 0
+
+
+def do_dispatch(args) -> int:
+    rid = f"route_{dt.datetime.now(dt.timezone.utc):%Y%m%dT%H%M%SZ}_pi_{args.slug}"
+    create = ["create", "--route-id", rid,
+              "--origin-site", "lingxiaodian", "--origin-agent", "fable",
+              "--target-site", DEVICE, "--target-agent", "pi",
+              "--task-kind", args.kind,
+              "--title-original", args.title,
+              "--capability", "macos", "--capability", "pi",
+              "--instructions", args.prompt,
+              "--artifact-expected", "summary", "--artifact-expected", "evidence"]
+    for c in (args.constraint or ["read_only_first", "no_secrets"]):
+        create += ["--constraint", c]
+    route_cmd(create)
+    # stash optional runtime hints on the route via show/re-create is overkill; envelope reads them
+    print(f"[{now()}] created route {rid}")
+    return do_run(rid, args.wait, args.verify)
+
+
+def do_collect(args) -> int:
+    reply = pull_reply(args.route_id)
+    if not reply:
+        print(f"no reply present for {args.route_id}")
+        return 3
+    submit_reply(args.route_id, reply)
+    cleanup_remote(args.route_id)
+    print(f"reply collected: status={reply.get('status')}")
+    return 0
+
+
+def do_remote_doctor(_args) -> int:
+    try:
+        ensure_remote_dirs()
+    except Exception as exc:
+        print(json.dumps({"reachable": False, "error": str(exc)}, ensure_ascii=False))
+        return 1
+    r = ssh_run(f"echo host=$(hostname); echo inbox=$(ls {REMOTE_BASE}/inbox 2>/dev/null | wc -l); "
+                f"echo outbox=$(ls {REMOTE_BASE}/outbox 2>/dev/null | wc -l)")
+    print(json.dumps({
+        "reachable": r.returncode == 0,
+        "transport": f"frp-reverse-ssh:{FRP_HOST}:{FRP_PORT}",
+        "remote_base": REMOTE_BASE,
+        "remote": (r.stdout or "").strip().replace("\n", " "),
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="ctx-huaguoshan-pi-bridge")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    d = sub.add_parser("dispatch", help="create + run a pi route in one shot")
+    d.add_argument("--title", required=True)
+    d.add_argument("--prompt", required=True)
+    d.add_argument("--slug", default="task")
+    d.add_argument("--kind", default="inspect")
+    d.add_argument("--constraint", action="append")
+    d.add_argument("--wait", type=int, default=300)
+    d.add_argument("--verify", action="store_true")
+
+    r = sub.add_parser("run", help="claim+push+collect an existing route")
+    r.add_argument("--route-id", required=True)
+    r.add_argument("--wait", type=int, default=300)
+    r.add_argument("--verify", action="store_true")
+
+    c = sub.add_parser("collect", help="pull a reply already produced on the Mac")
+    c.add_argument("--route-id", required=True)
+
+    sub.add_parser("remote-doctor", help="check FRP reachability + remote inbox/outbox")
+
+    args = p.parse_args()
+    if args.cmd == "dispatch":
+        return do_dispatch(args)
+    if args.cmd == "run":
+        return do_run(args.route_id, args.wait, args.verify)
+    if args.cmd == "collect":
+        return do_collect(args)
+    if args.cmd == "remote-doctor":
+        return do_remote_doctor(args)
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

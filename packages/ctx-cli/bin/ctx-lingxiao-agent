@@ -1,0 +1,675 @@
+#!/usr/bin/env python3
+"""Lingxiaodian CTX L2 local agent.
+
+Manual-first agent that claims eligible Lingxiaodian routes, invokes the local
+L1 ctx-codex bridge, and writes a metadata-first L2 reply. It is intentionally
+not a service manager and does not read secret-bearing files.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parents[2]
+
+
+def env_list(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    return tuple(item for item in raw.split(os.pathsep) if item)
+
+
+ROUTE_CTL = os.environ.get("CTX_ROUTE", str(SCRIPT_DIR / "ctx-route"))
+CODEX_CTL = os.environ.get("CTX_CODEX", "ctx-codex-bridge")
+SELF_AGENT_KEY = os.environ.get("CTX_AGENT_KEY", "lingxiaodian/codex-bridge")
+CAPABILITY_VOCAB_PATH = Path(os.environ.get(
+    "CTX_CAPABILITY_VOCAB_PATH",
+    str(REPO_ROOT / "specs" / "CTX-capability-vocab.md"),
+))
+DEFAULT_SELF_PROFILE = {
+    "agent_key": "lingxiaodian/codex-bridge",
+    "agent_id": "lingxiaodian:codex",
+    "device_id": "lingxiaodian",
+    "engine": {"name": "codex", "version": "0.0.0", "model": "unknown"},
+    "capabilities": ["os.linux", "runtime.codex", "exec.shell", "ctx.route"],
+    "constraints_supported": ["read_only_first", "no_secrets"],
+}
+FALLBACK_CAPABILITY_TOKENS = frozenset({
+    "os.linux",
+    "os.macos",
+    "os.windows",
+    "runtime.pi",
+    "runtime.codex",
+    "runtime.shell",
+    "exec.shell",
+    "fs.read",
+    "fs.write",
+    "probe.read-only",
+    "net.frp",
+    "transport.file-drop",
+    "transport.local",
+    "ctx.route",
+    "ctx.smoke",
+    "reason.general",
+    "ui.gui",
+})
+STARTED_AT = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+INSTANCE_ID = os.environ.get("CTX_AGENT_INSTANCE_ID", f"{socket.gethostname()}:{os.getpid()}:{STARTED_AT}")
+ROUTE_METRICS: list[dict[str, object]] = []
+MAX_METRIC_EVENTS = 8
+
+DEVICE_ID = DEFAULT_SELF_PROFILE["device_id"]
+AGENT_ID = DEFAULT_SELF_PROFILE["agent_id"]
+CAPABILITIES = frozenset(DEFAULT_SELF_PROFILE["capabilities"])
+ALLOWED_CONSTRAINTS = frozenset(DEFAULT_SELF_PROFILE["constraints_supported"])
+AGENT_ENGINE = dict(DEFAULT_SELF_PROFILE["engine"])
+ALLOWED_TASK_KINDS = {"inspect", "verify", "review", "handoff", "audit_handoff"}
+DEFAULT_WORKDIR = os.environ.get("CTX_DEFAULT_WORKDIR", str(Path.cwd()))
+ALLOWED_CWD_PREFIXES = env_list("CTX_ALLOWED_CWD_PREFIXES", (DEFAULT_WORKDIR, "/tmp"))
+BLOCKED_CWD_PARTS = (
+    "/.ssh",
+    "/.codex",
+    "/.factory",
+    "/.deepseek",
+    "/.config",
+)
+
+
+def load_controlled_capability_tokens() -> frozenset[str]:
+    try:
+        text = CAPABILITY_VOCAB_PATH.read_text(encoding="utf-8")
+    except Exception:
+        return FALLBACK_CAPABILITY_TOKENS
+    tokens = {
+        match.group(1)
+        for match in re.finditer(r"`([a-z0-9]+(?:\.[a-z0-9-]+)+)`", text)
+    }
+    return frozenset(tokens or FALLBACK_CAPABILITY_TOKENS)
+
+
+CONTROLLED_CAPABILITY_TOKENS = load_controlled_capability_tokens()
+
+
+def _run_route_show(agent_key: str) -> dict | None:
+    result = subprocess.run(
+        [ROUTE_CTL, "agent-show", agent_key],
+        text=True,
+        capture_output=True,
+        timeout=15,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        payload = json.loads((result.stdout or "").strip())
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def load_self_profile(agent_key: str = SELF_AGENT_KEY) -> dict:
+    profile = _run_route_show(agent_key)
+    if not profile:
+        profile = dict(DEFAULT_SELF_PROFILE)
+        profile["agent_key"] = agent_key
+    return profile
+
+
+def refresh_self_identity(agent_key: str = SELF_AGENT_KEY) -> dict:
+    global DEVICE_ID, AGENT_ID, CAPABILITIES, ALLOWED_CONSTRAINTS, AGENT_ENGINE
+    profile = load_self_profile(agent_key)
+    DEVICE_ID = str(profile.get("device_id") or DEFAULT_SELF_PROFILE["device_id"])
+    AGENT_ID = str(profile.get("agent_id") or DEFAULT_SELF_PROFILE["agent_id"])
+    CAPABILITIES = frozenset(str(token) for token in (profile.get("capabilities") or DEFAULT_SELF_PROFILE["capabilities"]))
+    ALLOWED_CONSTRAINTS = frozenset(
+        str(token) for token in (profile.get("constraints_supported") or DEFAULT_SELF_PROFILE["constraints_supported"])
+    )
+    engine = profile.get("engine") if isinstance(profile.get("engine"), dict) else {}
+    AGENT_ENGINE = {
+        "name": str(engine.get("name") or DEFAULT_SELF_PROFILE["engine"]["name"]),
+        "version": str(engine.get("version") or DEFAULT_SELF_PROFILE["engine"]["version"]),
+        "model": str(engine.get("model") or DEFAULT_SELF_PROFILE["engine"]["model"]),
+    }
+    profile["agent_key"] = str(profile.get("agent_key") or agent_key)
+    profile["device_id"] = DEVICE_ID
+    profile["agent_id"] = AGENT_ID
+    profile["capabilities"] = sorted(CAPABILITIES)
+    profile["constraints_supported"] = sorted(ALLOWED_CONSTRAINTS)
+    profile["engine"] = dict(AGENT_ENGINE)
+    return profile
+
+
+SELF_PROFILE = refresh_self_identity()
+
+
+def now() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def code_fingerprint(path: Path) -> dict[str, str]:
+    try:
+        data = path.read_bytes()
+        mtime = dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc).replace(microsecond=0)
+        return {
+            "path": str(path),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "mtime": mtime.isoformat().replace("+00:00", "Z"),
+        }
+    except Exception as exc:
+        return {"path": str(path), "error": str(exc)[:200]}
+
+
+LOADED_CODE = code_fingerprint(Path(__file__).resolve())
+
+
+def code_fingerprint_args() -> list[str]:
+    current = code_fingerprint(Path(__file__).resolve())
+    args = ["--tool-path", current["path"]]
+    if current.get("sha256"):
+        args.extend(["--tool-sha256", current["sha256"], "--tool-mtime", current.get("mtime", "")])
+    else:
+        args.extend(["--tool-error", current.get("error", "")])
+    if LOADED_CODE.get("sha256"):
+        args.extend([
+            "--loaded-tool-sha256",
+            LOADED_CODE["sha256"],
+            "--loaded-tool-mtime",
+            LOADED_CODE.get("mtime", ""),
+        ])
+    return args
+
+
+def record_metric(operation: str, elapsed_ms: int, ok: bool, attempts: int = 1) -> None:
+    ROUTE_METRICS.append({
+        "operation": operation,
+        "elapsed_ms": elapsed_ms,
+        "ok": ok,
+        "attempts": attempts,
+        "observed_at": now(),
+    })
+
+
+def metrics_snapshot() -> dict:
+    events = ROUTE_METRICS[-MAX_METRIC_EVENTS:]
+    elapsed = [int(event.get("elapsed_ms") or 0) for event in ROUTE_METRICS]
+    return {
+        "schema": "ctx-agent-route-metrics-v1",
+        "call_count": len(ROUTE_METRICS),
+        "failed_call_count": sum(1 for event in ROUTE_METRICS if not event.get("ok")),
+        "total_elapsed_ms": sum(elapsed),
+        "max_elapsed_ms": max(elapsed) if elapsed else 0,
+        "recent": events,
+    }
+
+
+def metrics_args() -> list[str]:
+    return ["--metrics-json", json.dumps(metrics_snapshot(), ensure_ascii=False, separators=(",", ":"))]
+
+
+def run_json(args: list[str], input_obj: dict | None = None, timeout: int = 30) -> object:
+    data = json.dumps(input_obj, ensure_ascii=False) if input_obj is not None else None
+    operation = args[0] if args else "unknown"
+    started = time.monotonic()
+    try:
+        result = subprocess.run([ROUTE_CTL, *args], input=data, text=True, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        record_metric(operation, int((time.monotonic() - started) * 1000), False)
+        raise
+    record_metric(operation, int((time.monotonic() - started) * 1000), result.returncode == 0)
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or "ctx-route command failed").strip())
+    out = (result.stdout or "").strip()
+    if not out:
+        return None
+    return json.loads(out)
+
+
+def is_claim_race_error(exc: Exception) -> bool:
+    text = str(exc)
+    return "route not claimable:" in text or "route cannot start from status=" in text
+
+
+def is_reply_race_error(exc: Exception) -> bool:
+    text = str(exc)
+    return (
+        "route cannot receive reply from status=" in text
+        or "lease_id mismatch" in text
+        or "does not own the lease" in text
+        or "active lease has expired" in text
+        or "active lease is missing" in text
+    )
+
+
+def route_can_receive_reply(route_id: str) -> bool:
+    current = run_json(["show", route_id])
+    status = current.get("status") if isinstance(current, dict) else None
+    if status in (None, "running"):
+        return True
+    print(f"skip {route_id}: route status became {status}; not writing late reply")
+    return False
+
+
+def device_profile() -> dict:
+    os_tokens = [token for token in CAPABILITIES if token.startswith("os.")]
+    return {
+        "device_id": DEVICE_ID,
+        "site": DEVICE_ID,
+        "os": os_tokens[0].split(".", 1)[1] if os_tokens else "unknown",
+        "availability": str(SELF_PROFILE.get("availability") or "always_on_target"),
+        "agents": [str(SELF_PROFILE.get("agent_key") or SELF_AGENT_KEY)],
+        "capabilities": sorted(CAPABILITIES),
+        "transports": list(SELF_PROFILE.get("transports") or ["local-file-ledger"]),
+        "health": "up",
+        "red_lines": [
+            "no_secret_printing",
+            "no_service_mutation_without_approval",
+            "no_unrestricted_remote_shell",
+        ],
+    }
+
+
+def publish_profile() -> None:
+    print(json.dumps(run_json(["device-upsert", "--profile-file", "-"], device_profile()), ensure_ascii=False))
+    print(json.dumps(agent_heartbeat("profile"), ensure_ascii=False))
+
+
+def agent_heartbeat(state: str = "active") -> object:
+    return run_json([
+        "agent-heartbeat",
+        "--device-id",
+        DEVICE_ID,
+        "--agent-id",
+        AGENT_ID,
+        "--instance-id",
+        INSTANCE_ID,
+        "--pid",
+        str(os.getpid()),
+        "--hostname",
+        socket.gethostname(),
+        "--started-at",
+        STARTED_AT,
+        "--role",
+        "lingxiaodian-ctx-codex-claimant",
+        "--state",
+        state,
+        *code_fingerprint_args(),
+        *metrics_args(),
+    ])
+
+
+def agent_retire() -> object:
+    return agent_heartbeat("stopped")
+
+
+def safe_cwd(route: dict) -> str:
+    requested = route.get("cwd") or DEFAULT_WORKDIR
+    path = os.path.abspath(str(requested))
+    if any(part in path for part in BLOCKED_CWD_PARTS):
+        raise ValueError(f"blocked cwd: {path}")
+    if not any(path == prefix or path.startswith(prefix + "/") for prefix in ALLOWED_CWD_PREFIXES):
+        raise ValueError(f"cwd outside allowed prefixes: {path}")
+    if not os.path.isdir(path):
+        raise ValueError(f"cwd does not exist: {path}")
+    return path
+
+
+def parse_semver(value: object) -> tuple[int, ...] | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    match = re.match(r"^(\d+)\.(\d+)\.(\d+)", text)
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups())
+
+
+def agent_is_approval_capable() -> bool:
+    return "approval.capable" in CAPABILITIES
+
+
+def unknown_capability_tokens(route: dict) -> set[str]:
+    tokens = set(route.get("required_capabilities") or [])
+    secret_tokens = route.get("secret_capabilities")
+    if isinstance(secret_tokens, list):
+        tokens.update(secret_tokens)
+    return {str(token) for token in tokens if str(token) not in CONTROLLED_CAPABILITY_TOKENS}
+
+
+def required_engine_satisfied(route: dict) -> tuple[bool, str]:
+    required = route.get("required_engine")
+    if required in (None, ""):
+        return True, "required_engine not set"
+    if not isinstance(required, dict):
+        return False, "required_engine invalid"
+    required_name = str(required.get("name") or "").strip()
+    version_min = str(required.get("version_min") or "").strip()
+    agent_name = str(AGENT_ENGINE.get("name") or "").strip()
+    agent_version = parse_semver(AGENT_ENGINE.get("version"))
+    min_version = parse_semver(version_min)
+    if not required_name or not version_min or min_version is None:
+        return False, "required_engine invalid"
+    if agent_name != required_name:
+        return False, "required_engine name mismatch"
+    if agent_version is None or agent_version < min_version:
+        return False, "required_engine version too low"
+    return True, "required_engine satisfied"
+
+
+def route_eligible(route: dict) -> tuple[bool, str]:
+    if route.get("target_site") != DEVICE_ID:
+        return False, "target_site mismatch"
+    if route.get("status") != "queued":
+        return False, "status is not queued"
+    unknown = unknown_capability_tokens(route)
+    if unknown:
+        return False, f"unroutable: unknown capability token(s): {', '.join(sorted(unknown))}"
+    required = set(route.get("required_capabilities") or [])
+    if not required.issubset(CAPABILITIES):
+        return False, "required capabilities not available"
+    raw_constraints = route.get("constraints")
+    if raw_constraints is None:
+        constraints = set()
+    elif isinstance(raw_constraints, list):
+        constraints = {str(token) for token in raw_constraints}
+    else:
+        return False, "constraints invalid"
+    if not constraints.issubset(ALLOWED_CONSTRAINTS):
+        return False, "constraints outside safe allowlist"
+    required_engine_ok, required_engine_reason = required_engine_satisfied(route)
+    if not required_engine_ok:
+        return False, required_engine_reason
+    if route.get("approval_required") and not agent_is_approval_capable():
+        return False, "approval required but agent is not approval-capable"
+    if route.get("secret_capabilities") != []:
+        return False, "secret_capabilities default-deny before Secret Box"
+    return True, "eligible"
+
+
+def route_task(route: dict) -> str:
+    identity = {
+        "trace_id": route.get("trace_id") or route.get("route_id"),
+        "lane_id": route.get("lane_id") or route.get("work_chat_id") or route.get("context_id") or route.get("trace_id") or route.get("route_id"),
+        "work_chat_id": route.get("work_chat_id"),
+        "context_id": route.get("context_id"),
+        "route_id": route.get("route_id"),
+        "executor_site": DEVICE_ID,
+        "executor_agent": AGENT_ID,
+        "origin_site": route.get("origin_site"),
+        "origin_agent": route.get("origin_agent"),
+        "target_site": route.get("target_site"),
+        "target_agent": route.get("target_agent"),
+        "task_kind": route.get("task_kind"),
+        "session_visibility": "persisted",
+        "constraints": route.get("constraints") or [],
+    }
+    route_view = {
+        "route_id": route.get("route_id"),
+        "trace_id": route.get("trace_id") or route.get("route_id"),
+        "lane_id": route.get("lane_id") or route.get("work_chat_id") or route.get("context_id") or route.get("trace_id") or route.get("route_id"),
+        "work_chat_id": route.get("work_chat_id"),
+        "context_id": route.get("context_id"),
+        "origin_site": route.get("origin_site"),
+        "origin_agent": route.get("origin_agent"),
+        "target_site": route.get("target_site"),
+        "target_agent": route.get("target_agent"),
+        "task_kind": route.get("task_kind"),
+        "title": route.get("title_auto") or route.get("title_original"),
+        "constraints": route.get("constraints") or [],
+        "required_capabilities": route.get("required_capabilities") or [],
+    }
+    instructions = route.get("instructions") or route.get("title_original") or route.get("title_auto")
+    return f"""Handle this CTX L2 route as Lingxiaodian local Codex.
+
+CTX-CALL-IDENTITY:
+{json.dumps(identity, ensure_ascii=False, indent=2)}
+
+Route metadata:
+{json.dumps(route_view, ensure_ascii=False, indent=2)}
+
+Task instructions:
+{instructions}
+
+Safety requirements:
+- Read-only first.
+- Do not read or print secrets, tokens, auth files, private keys, .env files, or credential configs.
+- Do not mutate systemd, firewall, SSH, FRP, Docker, cron, package-manager, or live service config.
+- Produce concise evidence and residual risk.
+
+At the end of your final answer, include these lines before any CTX closeout
+block required by the caller:
+CTX-ROUTE-ID: {route.get("route_id")}
+CTX-EXECUTOR: {AGENT_ID}
+CTX-SESSION-VISIBILITY: persisted
+"""
+
+
+def parse_brief(stdout: str) -> dict:
+    out: dict[str, object] = {"stdout_tail": "\n".join((stdout or "").splitlines()[-40:])}
+    for line in (stdout or "").splitlines():
+        match = re.match(r"^(task_id|status|exit_code|codex_returncode|verdict):\s*(.*)$", line.strip())
+        if match:
+            out[match.group(1)] = match.group(2)
+    return out
+
+
+def ctx_base() -> Path:
+    if os.environ.get("CTX_BASE"):
+        return Path(os.environ["CTX_BASE"])
+    state_home = os.environ.get("XDG_STATE_HOME")
+    if state_home:
+        return Path(state_home) / "asc-context-engine"
+    return Path.cwd() / "ctx-data"
+
+
+def load_task_result(task_id: str | None) -> dict:
+    if not task_id:
+        return {}
+    path = ctx_base() / "done" / f"{task_id}.json"
+    if not path.exists():
+        return {"result_path": str(path), "result_exists": False}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["result_path"] = str(path)
+        data["result_exists"] = True
+        return data
+    except Exception as exc:
+        return {"result_path": str(path), "result_exists": True, "result_error": str(exc)}
+
+
+def summarize_ctx_codex_result(status: str, task_result: dict, brief: dict, timeout: int) -> str:
+    stdout_tail = str(brief.get("stdout_tail") or "").strip()
+    task_summary = str(task_result.get("summary") or "").strip()
+    if status == "timeout":
+        safe_tail_lines = []
+        for line in stdout_tail.splitlines():
+            stripped = line.strip()
+            if re.match(r"^(task_id|status|exit_code|elapsed):\s*", stripped):
+                safe_tail_lines.append(stripped[:200])
+        parts = [
+            f"ctx-codex timed out before compliant closeout after {timeout}s.",
+            "See reply artifacts for the task result and stdout log.",
+        ]
+        if safe_tail_lines:
+            parts.append("task excerpt: " + "; ".join(safe_tail_lines[:6]))
+        return " ".join(parts)
+    return task_summary or stdout_tail
+
+
+def run_ctx_codex(route: dict, timeout: int) -> dict:
+    cwd = safe_cwd(route)
+    task = route_task(route)
+    cmd = [
+        CODEX_CTL,
+        "run",
+        "--task",
+        task,
+        "--cwd",
+        cwd,
+        "--constraints",
+        "read_only_first;no_secrets;no_system_mutation;no_service_mutation",
+        "--timeout",
+        str(timeout),
+        "--spawned-by",
+        f"ctx-l2:{route['route_id']}",
+        "--title",
+        route.get("title_auto") or route.get("title_original") or route["route_id"],
+        "--kind",
+        route.get("task_kind") or "inspect",
+    ]
+    started = now()
+    result = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout + 30)
+    stdout = (result.stdout or "") + (("\n[stderr]\n" + result.stderr) if result.stderr else "")
+    brief = parse_brief(stdout)
+    task_result = load_task_result(str(brief.get("task_id") or ""))
+    status = str(task_result.get("status") or brief.get("status") or "failed")
+    if status in ("success", "done-unverified"):
+        reply_status = "replied"
+    elif status == "blocked":
+        reply_status = "blocked"
+    else:
+        reply_status = "failed"
+    summary = summarize_ctx_codex_result(status, task_result, brief, timeout)
+    evidence = [
+        {
+            "kind": "ctx-codex-run",
+            "value": "ctx-codex run",
+            "exit_code": result.returncode,
+            "observed_at": started,
+            "task_id": brief.get("task_id"),
+            "ctx_status": status,
+            "verdict": task_result.get("verdict") or brief.get("verdict"),
+            "result_path": task_result.get("result_path"),
+        }
+    ]
+    artifacts = []
+    if task_result.get("result_path"):
+        artifacts.append({"path": task_result["result_path"], "kind": "ctx-codex-result"})
+    stdout_path = None
+    if brief.get("task_id"):
+        stdout_path = str(ctx_base() / "done" / f"{brief['task_id']}.out.log")
+        artifacts.append({"path": stdout_path, "kind": "ctx-codex-stdout-log"})
+    return {
+        "route_id": route["route_id"],
+        "status": reply_status,
+        "replied_at": now(),
+        "executed_by": AGENT_ID,
+        "summary": summary[:2000],
+        "evidence": evidence,
+        "artifacts": artifacts,
+        "secret_events": [],
+        "residual_risk": str(task_result.get("residual") or "Nested ctx-codex result was not independently verified by a second agent."),
+        "next_action": "verify",
+    }
+
+
+def process_route(route: dict, timeout: int) -> bool:
+    eligible, reason = route_eligible(route)
+    if not eligible:
+        print(f"skip {route.get('route_id')}: {reason}")
+        return False
+    rid = route["route_id"]
+    print(f"claiming {rid}: {route.get('title_auto')}")
+    try:
+        claim_result = run_json([
+            "claim",
+            rid,
+            "--device-id",
+            DEVICE_ID,
+            "--agent-id",
+            AGENT_ID,
+            "--instance-id",
+            INSTANCE_ID,
+            "--lease-seconds",
+            str(timeout + 300),
+        ])
+        lease_id = claim_result.get("lease_id") if isinstance(claim_result, dict) else None
+        start_args = ["start", rid, "--agent-id", AGENT_ID, "--instance-id", INSTANCE_ID]
+        if lease_id:
+            start_args.extend(["--lease-id", str(lease_id)])
+        run_json(start_args)
+    except RuntimeError as exc:
+        if is_claim_race_error(exc):
+            print(f"skip {rid}: route was claimed or started by another agent instance")
+            return False
+        raise
+    reply = run_ctx_codex(route, timeout)
+    if not route_can_receive_reply(rid):
+        return False
+    try:
+        reply_args = ["reply", rid, "--reply-file", "-", "--agent-id", AGENT_ID, "--instance-id", INSTANCE_ID]
+        if lease_id:
+            reply_args.extend(["--lease-id", str(lease_id)])
+        print(json.dumps(run_json(reply_args, reply), ensure_ascii=False))
+    except RuntimeError as exc:
+        if is_reply_race_error(exc):
+            print(f"skip {rid}: route stopped accepting replies before reply write")
+            return False
+        raise
+    return True
+
+
+def run_once(args: argparse.Namespace, retire_on_exit: bool = True) -> int:
+    try:
+        run_json(["device-upsert", "--profile-file", "-"], device_profile())
+        agent_heartbeat("active")
+        routes = run_json(["list", "--status", "queued", "--target-site", DEVICE_ID, "--limit", "1000", "--json"])
+        if not isinstance(routes, list):
+            raise RuntimeError("unexpected route list payload")
+        for route in routes:
+            if process_route(route, args.timeout):
+                return 0
+        print("no eligible lingxiaodian routes")
+        return 0
+    finally:
+        if retire_on_exit:
+            agent_retire()
+
+
+def run_loop(args: argparse.Namespace) -> int:
+    count = 0
+    try:
+        while True:
+            run_once(args, retire_on_exit=False)
+            count += 1
+            if args.iterations and count >= args.iterations:
+                return 0
+            time.sleep(args.interval)
+    finally:
+        agent_retire()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="ctx-lingxiao-agent")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("profile")
+    once = sub.add_parser("once")
+    once.add_argument("--timeout", type=int, default=120)
+    loop = sub.add_parser("loop")
+    loop.add_argument("--timeout", type=int, default=120)
+    loop.add_argument("--interval", type=int, default=30)
+    loop.add_argument("--iterations", type=int, default=0)
+    args = parser.parse_args()
+    if args.cmd == "profile":
+        publish_profile()
+        return 0
+    if args.cmd == "once":
+        return run_once(args)
+    if args.cmd == "loop":
+        return run_loop(args)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

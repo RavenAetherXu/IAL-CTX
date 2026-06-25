@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+"""ctx-lx-worker — local executor for reverse CTX routes.
+
+Mirror of the Mac-side ctx-pi-worker, plus ledger integration. It watches the
+local inbox, and for each task envelope dropped
+there by the reverse-poller:
+
+  1. idempotent `ctx-route create` (using the envelope's route_id) — this is the
+     A2 "create-on-ingest" ledger registration; Huaguoshan never touches the ledger.
+  2. claim + start (lease) on the local ledger,
+  3. execute the prompt with local `pi -p`,
+  4. write the reply BOTH to the ledger (ctx-route reply) AND to the local
+     outbox so the reverse-poller can ship it back to the remote peer.
+
+Idempotency: if the route is already in a terminal state, execution is skipped
+(covers a re-pull after a poller crash). Ledger writes only ever happen here, on
+Lingxiaodian — consistent with the single-source-of-truth principle.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def default_pi_home() -> Path:
+    state_home = os.environ.get("XDG_STATE_HOME")
+    if state_home:
+        return Path(state_home) / "asc-context-engine" / "pi"
+    return Path.cwd() / "ctx-pi"
+
+
+ROUTE_CTL = os.environ.get("CTX_ROUTE", str(SCRIPT_DIR / "ctx-route"))
+BASE = Path(os.environ.get("CTX_LX_HOME") or default_pi_home())
+INBOX = BASE / "inbox"
+PROCESSING = BASE / "processing"
+OUTBOX = BASE / "outbox"
+DONE = BASE / "done"
+LOGS = BASE / "logs"
+DEVICE = "lingxiaodian"
+AGENT_ID = "lingxiaodian:fable"
+PI_BIN = os.environ.get("PI_BIN") or shutil.which("pi") or "pi"
+TERMINAL = {"replied", "verified", "failed", "cancelled", "expired", "needs_approval", "blocked"}
+STATUS_RE = re.compile(r"^CTX-REPLY-STATUS:\s*(ok|failed)\s*$", re.IGNORECASE | re.MULTILINE)
+MAX_TAIL = 3000
+
+
+def now() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def ensure_dirs() -> None:
+    for d in (INBOX, PROCESSING, OUTBOX, DONE, LOGS):
+        d.mkdir(parents=True, exist_ok=True)
+
+
+def atomic_write_json(path: Path, payload: dict) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def route_cmd(args: list[str], stdin: str | None = None, timeout: int = 40) -> object:
+    r = subprocess.run([ROUTE_CTL, *args], input=stdin, text=True,
+                       capture_output=True, timeout=timeout)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout or "ctx-route failed").strip())
+    out = (r.stdout or "").strip()
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return out
+
+
+def route_status(rid: str) -> str | None:
+    try:
+        d = route_cmd(["show", rid])
+        return d.get("status") if isinstance(d, dict) else None
+    except RuntimeError:
+        return None
+
+
+def route_lease_args(rid: str, fallback_instance: str | None = None) -> list[str]:
+    route = route_cmd(["show", rid])
+    lease = route.get("lease") if isinstance(route, dict) and isinstance(route.get("lease"), dict) else {}
+    args = ["--agent-id", lease.get("claimed_by") or AGENT_ID]
+    instance_id = lease.get("claim_instance_id") or fallback_instance
+    if instance_id:
+        args.extend(["--instance-id", str(instance_id)])
+    if lease.get("lease_id"):
+        args.extend(["--lease-id", str(lease["lease_id"])])
+    return args
+
+
+def split_site_agent(value: str, default_agent: str) -> tuple[str, str]:
+    if not value:
+        return ("huaguoshan-macos", default_agent)
+    if ":" in value:
+        site, agent = value.split(":", 1)
+        # normalise common short site names
+        site = {"huaguoshan": "huaguoshan-macos"}.get(site, site)
+        return site, agent
+    return value, default_agent
+
+
+def ensure_route(task: dict) -> None:
+    rid = task["route_id"]
+    if route_status(rid):
+        return  # already registered (idempotent)
+    o_site, o_agent = split_site_agent(task.get("origin", "huaguoshan:pi"), "pi")
+    t_site, t_agent = split_site_agent(task.get("target", "lingxiaodian:fable"), "fable")
+    args = ["create", "--route-id", rid,
+            "--origin-site", o_site, "--origin-agent", o_agent,
+            "--target-site", t_site, "--target-agent", t_agent,
+            "--task-kind", task.get("task_kind", "inspect"),
+            "--title-original", (task.get("title") or task.get("prompt", "reverse route"))[:160],
+            "--capability", "pi",
+            "--instructions", task.get("prompt", ""),
+            "--artifact-expected", "summary", "--artifact-expected", "evidence"]
+    if task.get("trace_id"):
+        args += ["--trace-id", task["trace_id"]]
+    if task.get("lane_id"):
+        args += ["--lane-id", task["lane_id"]]
+    if task.get("work_chat_id"):
+        args += ["--work-chat-id", task["work_chat_id"]]
+    if task.get("context_id"):
+        args += ["--context-id", task["context_id"]]
+    for c in task.get("constraints") or []:
+        args += ["--constraint", c]
+    route_cmd(args)
+
+
+def build_prompt(task: dict) -> str:
+    rid = task.get("route_id", "unknown")
+    origin = task.get("origin", "huaguoshan:pi")
+    constraints = task.get("constraints") or []
+    lines = [
+        "CTX-ROUTE-WORKER (reverse direction)",
+        f"You are Lingxiaodian pi/Fable executing CTX route {rid}",
+        f"dispatched by {origin} through the ASC Context Engine.",
+        f"trace_id: {task.get('trace_id') or rid}",
+        f"lane_id: {task.get('lane_id') or task.get('work_chat_id') or task.get('context_id') or task.get('trace_id') or rid}",
+        f"work_chat_id: {task.get('work_chat_id') or ''}",
+        f"context_id: {task.get('context_id') or ''}",
+        "",
+        "Operating rules:",
+        "- Metadata-first. Never print secret values, tokens, .env contents, keys,",
+        "  or credential file bodies. Reference paths/IDs instead.",
+    ]
+    if "read_only_first" in constraints:
+        lines.append("- Prefer read-only inspection before any mutation.")
+    if constraints:
+        lines.append(f"- Declared constraints: {', '.join(constraints)}")
+    lines += ["", "Finish with a single final line exactly:",
+              "    CTX-REPLY-STATUS: ok    (or: CTX-REPLY-STATUS: failed)",
+              "", "TASK:", str(task.get("prompt", "")).strip()]
+    return "\n".join(lines)
+
+
+def run_pi(task: dict, prompt: str) -> tuple[int, str, str, bool]:
+    rid = task.get("route_id", "task")
+    cwd = os.path.expanduser(task.get("cwd") or str(Path.home()))
+    timeout = int(task.get("timeout_seconds") or 600)
+    extra = task.get("pi_args") if isinstance(task.get("pi_args"), list) else []
+    cmd = [PI_BIN, "-p", prompt, "--name", f"ctx:{rid}", *[str(a) for a in extra]]
+    try:
+        r = subprocess.run(cmd, cwd=cwd if os.path.isdir(cwd) else None, text=True,
+                           capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        return r.returncode, r.stdout or "", r.stderr or "", False
+    except subprocess.TimeoutExpired as exc:
+        out = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        err = exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        return 124, out, err, True
+
+
+def tail(text: str, limit: int = MAX_TAIL) -> str:
+    text = text or ""
+    return text if len(text) <= limit else "…" + text[-limit:]
+
+
+def first_summary(out: str) -> str:
+    for line in out.splitlines():
+        s = line.strip()
+        if s.upper().startswith("SUMMARY:"):
+            return s[len("SUMMARY:"):].strip()[:600]
+    lines = [l.strip() for l in out.splitlines() if l.strip() and not STATUS_RE.match(l.strip())]
+    return lines[-1][:600] if lines else ""
+
+
+def make_reply(rid: str, status: str, summary: str, exit_code: int, evidence: list) -> dict:
+    return {
+        "schema": "ctx-pi-reply-v1", "route_id": rid, "status": status, "summary": summary,
+        "evidence": evidence, "artifacts": [], "secret_events": [],
+        "residual_risk": "Executed by Lingxiaodian pi/Fable for a Huaguoshan-originated route.",
+        "next_action": "verify", "executed_by": AGENT_ID, "device": socket.gethostname(),
+        "replied_at": now(), "exit_code": exit_code,
+    }
+
+
+def submit_to_ledger(rid: str, reply: dict) -> None:
+    instance = f"{socket.gethostname()}:{os.getpid()}:{dt.datetime.now(dt.timezone.utc):%Y%m%dT%H%M%SZ}"
+    try:
+        claim = route_cmd(["claim", rid, "--device-id", DEVICE, "--agent-id", AGENT_ID,
+                           "--instance-id", instance, "--lease-seconds", "1200"])
+        lease_id = claim.get("lease_id") if isinstance(claim, dict) else None
+        start_args = ["start", rid, "--agent-id", AGENT_ID, "--instance-id", instance]
+        if lease_id:
+            start_args.extend(["--lease-id", str(lease_id)])
+        route_cmd(start_args)
+    except RuntimeError as exc:
+        # already claimed/started by a previous attempt is fine
+        if "not claimable" not in str(exc) and "cannot start" not in str(exc):
+            raise
+    ledger_reply = dict(reply)
+    ledger_reply["evidence"] = reply["evidence"] + [
+        {"kind": "transport", "value": "frp-reverse-pull; lingxiaodian-resident ledger write"}]
+    reply_args = ["reply", rid, "--reply-file", "-", *route_lease_args(rid, fallback_instance=instance)]
+    route_cmd(reply_args, stdin=json.dumps(ledger_reply, ensure_ascii=False))
+
+
+def process_task(task_path: Path) -> bool:
+    claimed = PROCESSING / task_path.name
+    try:
+        os.replace(task_path, claimed)
+    except FileNotFoundError:
+        return False
+    try:
+        task = json.loads(claimed.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"[{now()}] bad envelope {task_path.name}: {exc}", file=sys.stderr)
+        os.replace(claimed, DONE / claimed.name)
+        return True
+    rid = task.get("route_id") or claimed.stem.replace(".task", "")
+    task["route_id"] = rid
+
+    ensure_route(task)
+    st = route_status(rid)
+    if st in TERMINAL and (OUTBOX / f"{rid}.reply.json").exists():
+        print(f"[{now()}] route {rid} already terminal ({st}); skip re-exec")
+        os.replace(claimed, DONE / claimed.name)
+        return True
+
+    started = now()
+    print(f"[{now()}] executing reverse route {rid} via {PI_BIN}")
+    rc, out, err, timed_out = run_pi(task, build_prompt(task))
+    log_path = LOGS / f"{rid}.out.log"
+    log_path.write_text(f"# {rid}\n# {started}\n# exit {rc} timed_out={timed_out}\n"
+                        f"## STDOUT\n{out}\n\n## STDERR\n{err}\n", encoding="utf-8")
+    m = STATUS_RE.findall(out)
+    if timed_out:
+        status = "failed"
+    elif m:
+        status = "replied" if m[-1].lower() == "ok" else "failed"
+    else:
+        status = "replied" if rc == 0 else "failed"
+    summary = first_summary(out) or (f"pi exited {rc}" if status == "failed" else "pi completed route")
+    evidence = [{"kind": "pi-stdout-tail", "value": tail(out)},
+                {"kind": "pi-worker-log", "path": str(log_path)}]
+    if err.strip():
+        evidence.append({"kind": "pi-stderr-tail", "value": tail(err, 1200)})
+    reply = make_reply(rid, status, summary, rc, evidence)
+
+    submit_to_ledger(rid, reply)               # ledger (single source of truth)
+    atomic_write_json(OUTBOX / f"{rid}.reply.json", reply)  # for reverse-poller -> Mac
+    os.replace(claimed, DONE / claimed.name)
+    print(f"[{now()}] route {rid} -> {status} (exit {rc}); ledger+outbox written")
+    return True
+
+
+def run_once() -> int:
+    n = 0
+    for p in sorted(INBOX.glob("*.task.json")):
+        try:
+            if process_task(p):
+                n += 1
+        except Exception as exc:
+            print(f"[{now()}] error on {p.name}: {exc}", file=sys.stderr)
+    return n
+
+
+def main() -> int:
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+    ensure_dirs()
+    p = argparse.ArgumentParser(prog="ctx-lx-worker")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("once")
+    lp = sub.add_parser("loop"); lp.add_argument("--interval", type=float, default=5.0)
+    sub.add_parser("doctor")
+    args = p.parse_args()
+    if args.cmd == "once":
+        print(f"processed {run_once()} task(s)"); return 0
+    if args.cmd == "doctor":
+        print(json.dumps({"base": str(BASE), "pi_bin": PI_BIN,
+                          "inbox_pending": len(list(INBOX.glob('*.task.json'))),
+                          "device": socket.gethostname()}, ensure_ascii=False, indent=2)); return 0
+    print(f"[{now()}] ctx-lx-worker loop interval={args.interval}s pi={PI_BIN}")
+    while True:
+        try:
+            run_once()
+        except Exception as exc:
+            print(f"[{now()}] loop error: {exc}", file=sys.stderr)
+        time.sleep(args.interval)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

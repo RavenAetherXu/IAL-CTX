@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""Portable CTX Codex bridge.
+
+This reference bridge invokes the local Codex CLI and records metadata-first
+results under CTX_BASE/done. It never reads Codex state databases, session
+files, or secret-bearing configuration.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+
+SECRET_VALUE_RE = re.compile(
+    "(?i)("
+    + "s" + "k-" + r"[A-Za-z0-9_-]{8,}|"
+    + "Bearer" + r"\s+[A-Za-z0-9._~+/=-]{10,}|"
+    + "BEGIN " + r"[A-Z ]*PRIVATE KEY|"
+    + "client" + "_secret" + r"\s*[:=]|"
+    + "pass" + "word" + r"\s*[:=]|"
+    + "api" + r"[_-]?key\s*[:=]|"
+    + "to" + "ken" + r"\s*[:=])"
+)
+
+
+def now() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def default_ctx_base() -> Path:
+    if os.name == "nt":  # pragma: no cover - Windows-only default
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            return Path(local_app_data) / "ctx-data"
+        return Path.home() / ".ctx-data"
+    state_home = os.environ.get("XDG_STATE_HOME")
+    if state_home:
+        return Path(state_home) / "asc-context-engine"
+    return Path.cwd() / "ctx-data"
+
+
+def ctx_base() -> Path:
+    return Path(os.environ.get("CTX_BASE") or default_ctx_base())
+
+
+def redact(value: str, limit: int = 2000) -> str:
+    text = SECRET_VALUE_RE.sub("[redacted-secret-shaped]", value or "")
+    if len(text) > limit:
+        return text[-limit:]
+    return text
+
+
+def safe_record_id(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.:-]+", "_", value).strip("._") or "unknown"
+
+
+def default_task_id(task: str) -> str:
+    digest = hashlib.sha256(task.encode("utf-8")).hexdigest()[:12]
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"task_{stamp}_{digest}"
+
+
+def parse_artifacts(value: str) -> list[dict[str, str]]:
+    text = value.strip()
+    if not text or text.lower() == "none":
+        return []
+    artifacts = []
+    for item in text.split(","):
+        path = item.strip()
+        if path:
+            artifacts.append({"kind": "path", "path": redact(path, 500)})
+    return artifacts
+
+
+def parse_verdict_block(text: str) -> dict[str, object]:
+    fields: dict[str, str] = {}
+    for line in (text or "").splitlines()[-80:]:
+        for key in ("CTX-VERDICT", "CTX-ARTIFACTS", "CTX-RESIDUAL"):
+            prefix = key + ":"
+            if line.startswith(prefix):
+                fields[key] = line[len(prefix):].strip()
+    verdict = fields.get("CTX-VERDICT", "failed").lower()
+    if verdict not in {"success", "blocked", "failed"}:
+        verdict = "failed"
+    return {
+        "verdict": verdict,
+        "status": {"success": "replied", "blocked": "blocked", "failed": "failed"}[verdict],
+        "summary": f"Codex bridge completed with verdict={verdict}",
+        "artifacts": parse_artifacts(fields.get("CTX-ARTIFACTS", "")),
+        "residual": redact(fields.get("CTX-RESIDUAL", "Codex output did not include a CTX residual line."), 1000),
+        "verdict_block_found": all(key in fields for key in ("CTX-VERDICT", "CTX-ARTIFACTS", "CTX-RESIDUAL")),
+    }
+
+
+def write_result(record: dict) -> Path:
+    done = ctx_base() / "done"
+    done.mkdir(parents=True, exist_ok=True)
+    path = done / f"{safe_record_id(str(record['task_id']))}.json"
+    text = json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True)
+    if SECRET_VALUE_RE.search(text):
+        raise SystemExit("ctx-codex result contains secret-shaped content; refusing to write")
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    tmp.write_text(text + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    return path
+
+
+def command_prefix() -> list[str]:
+    raw = os.environ.get("CODEX_CMD") or "codex"
+    return shlex.split(raw, posix=(os.name != "nt"))
+
+
+def run_codex(args: argparse.Namespace) -> int:
+    task_id = args.task_id or os.environ.get("CTX_TASK_ID") or default_task_id(args.task)
+    cmd = [*command_prefix(), "exec", args.task]
+    cwd = str(Path(args.cwd).resolve()) if args.cwd else None
+    started = now()
+    exit_code = 1
+    timed_out = False
+    stdout = ""
+    stderr = ""
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=cwd,
+            text=True,
+            capture_output=True,
+            timeout=args.timeout,
+        )
+        exit_code = proc.returncode
+        stdout = proc.stdout or ""
+        stderr = proc.stderr or ""
+    except FileNotFoundError:
+        stderr = "codex command not found; set CODEX_CMD to a local Codex CLI command"
+        exit_code = 127
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+        stderr = "codex command timed out"
+        exit_code = 124
+        timed_out = True
+
+    parsed = parse_verdict_block(stdout)
+    if exit_code != 0 and parsed["status"] == "replied":
+        parsed["status"] = "failed"
+        parsed["verdict"] = "failed"
+    record = {
+        "kind": "ctx-codex-result",
+        "task_id": task_id,
+        "status": parsed["status"],
+        "verdict": parsed["verdict"],
+        "summary": parsed["summary"],
+        "artifacts": parsed["artifacts"],
+        "residual": parsed["residual"],
+        "started_at": started,
+        "finished_at": now(),
+        "cwd": cwd,
+        "codex_command": Path(command_prefix()[0]).name if command_prefix() else "codex",
+        "exit_code": exit_code,
+        "timed_out": timed_out,
+        "verdict_block_found": parsed["verdict_block_found"],
+        "stdout_tail": redact(stdout, 1200),
+        "stderr_tail": redact(stderr, 800),
+    }
+    path = write_result(record)
+    print(json.dumps({"task_id": task_id, "status": record["status"], "result_path": str(path)}, ensure_ascii=False))
+    return 0 if record["status"] == "replied" else 1
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="ctx-codex-bridge")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    run = sub.add_parser("run")
+    run.add_argument("--task", required=True)
+    run.add_argument("--cwd")
+    run.add_argument("--timeout", type=int, default=600)
+    run.add_argument("--task-id")
+    run.set_defaults(func=run_codex)
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

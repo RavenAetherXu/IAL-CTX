@@ -1,0 +1,18 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  ctx-cli:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run ctx-cli CI
+        env:
+          CTX_CI_SKIP_RUNTIME_SHA: "1"
+        run: bash packages/ctx-cli/run-ci.sh

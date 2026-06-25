@@ -1,0 +1,641 @@
+#!/usr/bin/env python3
+"""Lingxiaodian-side FRP claimant for Huaguoshan macOS routes.
+
+This agent keeps the CTX route ledger local on Lingxiaodian and uses only the
+FRP reverse SSH endpoint to run fixed read-only Huaguoshan probes. It avoids the
+historical Huaguoshan -> public SSH -> Lingxiaodian ledger path.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import shlex
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def env_list(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    return tuple(item for item in raw.split(os.pathsep) if item)
+
+
+ROUTE_CTL = os.environ.get("CTX_ROUTE", str(SCRIPT_DIR / "ctx-route"))
+FRP_SSH_HOST = os.environ.get("CTX_HGS_FRP_HOST", "127.0.0.1")
+FRP_SSH_PORT = os.environ.get("CTX_HGS_FRP_PORT", "6022")
+FRP_SSH_USER = os.environ.get("CTX_HGS_FRP_USER", "ctx")
+FRP_SSH_CONFIG = os.environ.get("CTX_HGS_FRP_SSH_CONFIG", "/dev/null")
+DEVICE_ID = "huaguoshan-macos"
+AGENT_KEY = os.environ.get("CTX_AGENT_KEY", "huaguoshan/frp-probe")
+AGENT_ID = os.environ.get("CTX_AGENT_ID", "huaguoshan-macos:frp-local-native")
+STARTED_AT = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+INSTANCE_ID = os.environ.get("CTX_AGENT_INSTANCE_ID", f"{socket.gethostname()}:{os.getpid()}:{STARTED_AT}")
+ROUTE_METRICS: list[dict[str, object]] = []
+MAX_METRIC_EVENTS = 8
+CAPABILITIES = ["macos", "frp-reverse-ssh", "read-only-probe", "ctx-l2-smoke"]
+ALLOWED_CONSTRAINTS = {"read_only_first", "no_secrets"}
+
+# --- FRP-first codex execution (drives Mac codex via 6022; ledger stays local) ---
+CODEX_BIN = os.environ.get("CTX_MAC_CODEX", "/Applications/Codex.app/Contents/Resources/codex")
+CODEX_CAPABILITIES = {
+    "macos", "codex", "codex-cli", "ctx-l2",
+    "read-only-inspect", "review", "handoff", "metadata-only",
+}
+# A codex route must carry at least one of these markers (disambiguates from probe routes).
+CODEX_MARKER_CAPABILITIES = {"codex", "codex-cli", "read-only-inspect", "review", "handoff"}
+CODEX_ALLOWED_CONSTRAINTS = {
+    "read_only_first", "no_secrets", "metadata_only",
+    "no_system_mutation", "no_service_mutation", "no_file_mutation",
+}
+CODEX_ALLOWED_TASK_KINDS = {"inspect", "review", "verify", "handoff"}
+CODEX_DEFAULT_CWD = os.environ.get("CTX_MAC_CODEX_WORKDIR", ".")
+CODEX_ALLOWED_CWD_PREFIXES = env_list("CTX_MAC_CODEX_ALLOWED_CWD_PREFIXES", (CODEX_DEFAULT_CWD, "/tmp"))
+ADVISORY_TARGET_AGENTS = {"codex", "ctx-codex", "capability", ""}
+CODEX_EXECUTED_BY = os.environ.get("CTX_FRP_CODEX_EXECUTED_BY", "huaguoshan-macos:codex")
+
+
+def now() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def code_fingerprint(path: Path) -> dict[str, str]:
+    try:
+        data = path.read_bytes()
+        mtime = dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc).replace(microsecond=0)
+        return {
+            "path": str(path),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "mtime": mtime.isoformat().replace("+00:00", "Z"),
+        }
+    except Exception as exc:
+        return {"path": str(path), "error": str(exc)[:200]}
+
+
+LOADED_CODE = code_fingerprint(Path(__file__).resolve())
+
+
+def code_fingerprint_args() -> list[str]:
+    current = code_fingerprint(Path(__file__).resolve())
+    args = ["--tool-path", current["path"]]
+    if current.get("sha256"):
+        args.extend(["--tool-sha256", current["sha256"], "--tool-mtime", current.get("mtime", "")])
+    else:
+        args.extend(["--tool-error", current.get("error", "")])
+    if LOADED_CODE.get("sha256"):
+        args.extend([
+            "--loaded-tool-sha256",
+            LOADED_CODE["sha256"],
+            "--loaded-tool-mtime",
+            LOADED_CODE.get("mtime", ""),
+        ])
+    return args
+
+
+def record_metric(operation: str, elapsed_ms: int, ok: bool, attempts: int = 1) -> None:
+    ROUTE_METRICS.append({
+        "operation": operation,
+        "elapsed_ms": elapsed_ms,
+        "ok": ok,
+        "attempts": attempts,
+        "observed_at": now(),
+    })
+
+
+def metrics_snapshot() -> dict:
+    events = ROUTE_METRICS[-MAX_METRIC_EVENTS:]
+    elapsed = [int(event.get("elapsed_ms") or 0) for event in ROUTE_METRICS]
+    return {
+        "schema": "ctx-agent-route-metrics-v1",
+        "call_count": len(ROUTE_METRICS),
+        "failed_call_count": sum(1 for event in ROUTE_METRICS if not event.get("ok")),
+        "total_elapsed_ms": sum(elapsed),
+        "max_elapsed_ms": max(elapsed) if elapsed else 0,
+        "recent": events,
+    }
+
+
+def metrics_args() -> list[str]:
+    return ["--metrics-json", json.dumps(metrics_snapshot(), ensure_ascii=False, separators=(",", ":"))]
+
+
+def run_json(args: list[str], input_obj: dict | None = None, timeout: int = 30) -> object:
+    data = json.dumps(input_obj, ensure_ascii=False) if input_obj is not None else None
+    operation = args[0] if args else "unknown"
+    started = time.monotonic()
+    try:
+        result = subprocess.run([ROUTE_CTL, *args], input=data, text=True, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        record_metric(operation, int((time.monotonic() - started) * 1000), False)
+        raise
+    record_metric(operation, int((time.monotonic() - started) * 1000), result.returncode == 0)
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or "ctx-route command failed").strip())
+    out = (result.stdout or "").strip()
+    if not out:
+        return None
+    return json.loads(out)
+
+
+def is_claim_race_error(exc: Exception) -> bool:
+    text = str(exc)
+    return "route not claimable:" in text or "route cannot start from status=" in text
+
+
+def is_reply_race_error(exc: Exception) -> bool:
+    text = str(exc)
+    return (
+        "route cannot receive reply from status=" in text
+        or "lease_id mismatch" in text
+        or "does not own the lease" in text
+        or "active lease has expired" in text
+        or "active lease is missing" in text
+    )
+
+
+def route_can_receive_reply(route_id: str) -> bool:
+    current = run_json(["show", route_id])
+    status = current.get("status") if isinstance(current, dict) else None
+    if status in (None, "running"):
+        return True
+    print(f"skip {route_id}: route status became {status}; not writing late reply")
+    return False
+
+
+def frp_target() -> str:
+    return f"{FRP_SSH_USER}@{FRP_SSH_HOST}"
+
+
+def frp_command(args: list[str], timeout: int = 10) -> dict:
+    started = now()
+    started_mono = time.monotonic()
+    remote_command = " ".join(shlex.quote(part) for part in args)
+    cmd = [
+        "ssh",
+        "-F",
+        FRP_SSH_CONFIG,
+        "-p",
+        FRP_SSH_PORT,
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=5",
+        frp_target(),
+        remote_command,
+    ]
+    command_view = ["ssh", "-F", FRP_SSH_CONFIG, "-p", FRP_SSH_PORT, frp_target(), *args]
+    try:
+        result = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "command": command_view,
+            "remote_args": args,
+            "exit_code": 124,
+            "elapsed_ms": int((time.monotonic() - started_mono) * 1000),
+            "stdout": (exc.stdout or "").strip()[:500] if isinstance(exc.stdout, str) else "",
+            "stderr": f"TimeoutExpired: command exceeded {timeout}s",
+            "observed_at": started,
+        }
+    except OSError as exc:
+        return {
+            "command": command_view,
+            "remote_args": args,
+            "exit_code": 127,
+            "elapsed_ms": int((time.monotonic() - started_mono) * 1000),
+            "stdout": "",
+            "stderr": f"{type(exc).__name__}: {str(exc)[:260]}",
+            "observed_at": started,
+        }
+    return {
+        "command": command_view,
+        "remote_args": args,
+        "exit_code": result.returncode,
+        "elapsed_ms": int((time.monotonic() - started_mono) * 1000),
+        "stdout": (result.stdout or "").strip()[:500],
+        "stderr": (result.stderr or "").strip()[:300],
+        "observed_at": started,
+    }
+
+
+def device_profile() -> dict:
+    return {
+        "device_id": DEVICE_ID,
+        "site": "huaguoshan",
+        "os": "macos",
+        "availability": "frp-reachable-from-lingxiaodian",
+        "agents": ["frp-local-native"],
+        "capabilities": CAPABILITIES,
+        "transports": [f"frp-reverse-ssh:{FRP_SSH_HOST}:{FRP_SSH_PORT}"],
+        "health": "up",
+        "red_lines": ["no_public_ssh_ledger_path", "no_arbitrary_remote_shell", "read_only_first"],
+    }
+
+
+def agent_heartbeat(state: str = "active") -> object:
+    return run_json([
+        "agent-heartbeat",
+        "--device-id",
+        DEVICE_ID,
+        "--agent-id",
+        AGENT_ID,
+        "--instance-id",
+        INSTANCE_ID,
+        "--pid",
+        str(os.getpid()),
+        "--hostname",
+        socket.gethostname(),
+        "--started-at",
+        STARTED_AT,
+        "--role",
+        "lingxiaodian-frp-huaguoshan-fixed-read-only-claimant",
+        "--state",
+        state,
+        *code_fingerprint_args(),
+        *metrics_args(),
+    ])
+
+
+def publish_profile() -> None:
+    print(json.dumps(run_json(["device-upsert", "--profile-file", "-"], device_profile()), ensure_ascii=False))
+    print(json.dumps(agent_heartbeat("profile"), ensure_ascii=False))
+
+
+def route_eligible(route: dict) -> bool:
+    if route.get("target_site") != DEVICE_ID:
+        return False
+    if route.get("target_agent") not in ("local-native", "frp-local-native"):
+        return False
+    if route.get("status") != "queued":
+        return False
+    required = set(route.get("required_capabilities") or [])
+    if not required.issubset(set(CAPABILITIES)):
+        return False
+    constraints = set(route.get("constraints") or [])
+    if not constraints.issubset(ALLOWED_CONSTRAINTS):
+        return False
+    if route.get("approval_required"):
+        return False
+    if route.get("secret_capabilities") or []:
+        return False
+    return route.get("probe") in (None, "", "mac-basic-status")
+
+
+def mac_basic_status(route: dict) -> dict:
+    commands = []
+    for remote_args in (
+        ["hostname"],
+        ["uname", "-a"],
+        ["whoami"],
+        ["date", "-u", "+%Y-%m-%dT%H:%M:%SZ"],
+    ):
+        item = frp_command(remote_args)
+        commands.append(item)
+        if item["exit_code"] != 0:
+            break
+    failed = [item for item in commands if item["exit_code"] != 0]
+    by_command = {tuple(item["remote_args"]): item for item in commands}
+    summary_bits = []
+    if ("hostname",) in by_command:
+        summary_bits.append(f"hostname={by_command[('hostname',)]['stdout'] or 'unavailable'}")
+    if ("whoami",) in by_command:
+        summary_bits.append(f"user={by_command[('whoami',)]['stdout'] or 'unavailable'}")
+    if ("date", "-u", "+%Y-%m-%dT%H:%M:%SZ") in by_command:
+        summary_bits.append(f"utc={by_command[('date', '-u', '+%Y-%m-%dT%H:%M:%SZ')]['stdout'] or 'unavailable'}")
+    if failed:
+        first_failed = failed[0]
+        summary_bits.append(
+            f"failed_command={' '.join(first_failed['remote_args'])} exit={first_failed['exit_code']}"
+        )
+    return {
+        "route_id": route["route_id"],
+        "status": "failed" if failed else "replied",
+        "replied_at": now(),
+        "executed_by": AGENT_ID,
+        "summary": (
+            "frp mac-basic-status failed: " if failed else "frp mac-basic-status completed: "
+        ) + ", ".join(summary_bits),
+        "evidence": [
+            {key: value for key, value in {
+                "kind": "frp-command",
+                "transport": f"frp-reverse-ssh:{FRP_SSH_HOST}:{FRP_SSH_PORT}",
+                "value": " ".join(item["remote_args"]),
+                "exit_code": item["exit_code"],
+                "elapsed_ms": item["elapsed_ms"],
+                "stdout_excerpt": item["stdout"],
+                "stderr_excerpt": item.get("stderr") or "",
+                "observed_at": item["observed_at"],
+            }.items() if value not in ("", None)}
+            for item in commands
+        ],
+        "artifacts": [],
+        "secret_events": [],
+        "residual_risk": "Only fixed read-only metadata commands were executed through FRP reverse SSH; no public SSH ledger path was used.",
+        "next_action": "verify",
+    }
+
+
+def codex_safe_cwd(route: dict) -> str:
+    requested = route.get("cwd") or CODEX_DEFAULT_CWD
+    path = os.path.normpath(str(requested))
+    if not any(path == p or path.startswith(p + "/") for p in CODEX_ALLOWED_CWD_PREFIXES):
+        raise ValueError(f"cwd outside allowed prefixes: {path}")
+    return path
+
+
+def codex_route_eligible(route: dict) -> bool:
+    if route.get("target_site") != DEVICE_ID:
+        return False
+    target_agent = route.get("target_agent") or ""
+    if target_agent and target_agent not in ADVISORY_TARGET_AGENTS and target_agent != CODEX_EXECUTED_BY:
+        return False
+    if route.get("status") != "queued":
+        return False
+    if route.get("approval_required"):
+        return False
+    if route.get("secret_capabilities") or []:
+        return False
+    required = set(route.get("required_capabilities") or [])
+    if not required or not required.issubset(CODEX_CAPABILITIES):
+        return False
+    if not (required & CODEX_MARKER_CAPABILITIES):
+        return False
+    constraints = set(route.get("constraints") or [])
+    if not constraints.issubset(CODEX_ALLOWED_CONSTRAINTS):
+        return False
+    if route.get("task_kind") not in CODEX_ALLOWED_TASK_KINDS:
+        return False
+    if route.get("probe"):
+        return False
+    try:
+        codex_safe_cwd(route)
+    except ValueError:
+        return False
+    return True
+
+
+def codex_route_task(route: dict) -> str:
+    identity = {
+        "trace_id": route.get("trace_id") or route.get("route_id"),
+        "route_id": route.get("route_id"),
+        "executor_site": "huaguoshan-macos",
+        "executor_agent": "codex",
+        "executor_transport": f"frp-reverse-ssh:{FRP_SSH_HOST}:{FRP_SSH_PORT}",
+        "origin_site": route.get("origin_site"),
+        "target_agent": route.get("target_agent"),
+        "task_kind": route.get("task_kind"),
+        "constraints": route.get("constraints") or [],
+    }
+    instructions = route.get("instructions") or route.get("title_original") or route.get("title_auto")
+    return (
+        "Handle this CTX L2 route as Huaguoshan macOS Codex (driven from Lingxiaodian over FRP).\n\n"
+        f"CTX-CALL-IDENTITY:\n{json.dumps(identity, ensure_ascii=False, indent=2)}\n\n"
+        f"Task instructions:\n{instructions}\n\n"
+        "Safety requirements:\n"
+        "- Stay within the route instructions and produce a direct final answer.\n"
+        "- Do not read or print secrets, tokens, auth files, private keys, .env, or credential configs.\n"
+        "- Do not mutate files, launchd, SSH, FRP, proxy, Docker, package manager, or system settings.\n"
+        "- Prefer no tool use unless the route explicitly requires read-only local inspection.\n"
+        "- Include concise evidence, assumptions, and residual risk in your final answer.\n"
+    )
+
+
+def frp_codex_exec(route: dict, timeout: int = 240) -> dict:
+    rid = route["route_id"]
+    cwd = codex_safe_cwd(route)
+    prompt = codex_route_task(route)
+    safe_id = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in rid)
+    remote_out = f"/tmp/ctx-frp-codex-{safe_id}.txt"
+    delim = "===CTX-FRP-LASTMSG==="
+    remote = (
+        f"{shlex.quote(CODEX_BIN)} exec --sandbox read-only --ephemeral --skip-git-repo-check "
+        f"--cd {shlex.quote(cwd)} -o {shlex.quote(remote_out)} - ; rc=$? ; "
+        f"echo {shlex.quote(delim)} ; cat {shlex.quote(remote_out)} 2>/dev/null ; "
+        f"rm -f {shlex.quote(remote_out)} ; exit $rc"
+    )
+    cmd = [
+        "ssh", "-F", FRP_SSH_CONFIG, "-p", FRP_SSH_PORT,
+        "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+        frp_target(), remote,
+    ]
+    started = now()
+    t0 = time.monotonic()
+    try:
+        result = subprocess.run(cmd, input=prompt, text=True, capture_output=True, timeout=timeout)
+        rc = result.returncode
+        out = result.stdout or ""
+        err = (result.stderr or "").strip()
+    except subprocess.TimeoutExpired:
+        record_metric("frp-codex", int((time.monotonic() - t0) * 1000), False)
+        return {
+            "route_id": rid, "status": "failed", "replied_at": now(),
+            "executed_by": CODEX_EXECUTED_BY, "result_link_kind": "ctx-codex-result",
+            "summary": f"frp codex timed out after {timeout}s",
+            "evidence": [{"kind": "frp-codex", "transport": f"frp-reverse-ssh:{FRP_SSH_HOST}:{FRP_SSH_PORT}", "exit_code": 124}],
+            "artifacts": [], "secret_events": [],
+            "residual_risk": "codex timed out; no result captured", "next_action": "verify",
+        }
+    elapsed = int((time.monotonic() - t0) * 1000)
+    # Prefer the -o last-message file (after the delimiter). codex can exit non-zero
+    # on a transient model-backend websocket reset WITHOUT flushing -o, even though
+    # it printed the final message to stdout; fall back to stdout-before-delimiter.
+    if delim in out:
+        stdout_before, _, after = out.partition(delim)
+        last_msg = after.strip()
+        stdout_before = stdout_before.strip()
+    else:
+        last_msg = ""
+        stdout_before = out.strip()
+    final = last_msg or stdout_before[-3000:]
+    summary = final or err[-500:] or "Codex produced no final message."
+    # A captured final answer (from -o file OR stdout) means codex completed the task.
+    status = "replied" if final else "failed"
+    rc_note = "" if rc == 0 else f" (codex exit={rc}; transient backend reconnect; final answer captured)"
+    record_metric("frp-codex", elapsed, status == "replied")
+    return {
+        "route_id": rid, "status": status, "replied_at": now(),
+        "executed_by": CODEX_EXECUTED_BY, "result_link_kind": "ctx-codex-result",
+        "summary": summary[:4000],
+        "evidence": [{
+            "kind": "frp-codex",
+            "transport": f"frp-reverse-ssh:{FRP_SSH_HOST}:{FRP_SSH_PORT}",
+            "exit_code": rc, "elapsed_ms": elapsed,
+            "stderr_excerpt": err[:300],
+            "observed_at": started,
+        }],
+        "artifacts": [], "secret_events": [],
+        "residual_risk": "codex ran read-only/ephemeral on Mac over FRP; ledger stayed local on Lingxiaodian (no public-SSH ledger path)." + rc_note,
+        "next_action": "verify",
+    }
+
+
+def process_codex_route(route: dict) -> bool:
+    rid = route["route_id"]
+    print(f"claiming(codex/frp) {rid}: {route.get('title_auto')}")
+    try:
+        claim_result = run_json([
+            "claim", rid, "--device-id", DEVICE_ID, "--agent-id", AGENT_ID,
+            "--instance-id", INSTANCE_ID, "--lease-seconds", "900",
+        ])
+        lease_id = claim_result.get("lease_id") if isinstance(claim_result, dict) else None
+        start_args = ["start", rid, "--agent-id", AGENT_ID, "--instance-id", INSTANCE_ID]
+        if lease_id:
+            start_args.extend(["--lease-id", str(lease_id)])
+        run_json(start_args)
+    except RuntimeError as exc:
+        if is_claim_race_error(exc):
+            print(f"skip {rid}: route was claimed or started by another agent instance")
+            return False
+        raise
+    reply = frp_codex_exec(route)
+    if not route_can_receive_reply(rid):
+        return False
+    try:
+        reply_args = ["reply", rid, "--reply-file", "-", "--agent-id", AGENT_ID, "--instance-id", INSTANCE_ID]
+        if lease_id:
+            reply_args.extend(["--lease-id", str(lease_id)])
+        print(json.dumps(run_json(reply_args, reply), ensure_ascii=False))
+    except RuntimeError as exc:
+        if is_reply_race_error(exc):
+            print(f"skip {rid}: route stopped accepting replies before reply write")
+            return False
+        raise
+    return True
+
+
+def process_route(route: dict) -> bool:
+    if codex_route_eligible(route):
+        return process_codex_route(route)
+    if not route_eligible(route):
+        return False
+    rid = route["route_id"]
+    print(f"claiming {rid}: {route.get('title_auto')}")
+    try:
+        claim_result = run_json([
+            "claim",
+            rid,
+            "--device-id",
+            DEVICE_ID,
+            "--agent-id",
+            AGENT_ID,
+            "--instance-id",
+            INSTANCE_ID,
+            "--lease-seconds",
+            "600",
+        ])
+        lease_id = claim_result.get("lease_id") if isinstance(claim_result, dict) else None
+        start_args = ["start", rid, "--agent-id", AGENT_ID, "--instance-id", INSTANCE_ID]
+        if lease_id:
+            start_args.extend(["--lease-id", str(lease_id)])
+        run_json(start_args)
+    except RuntimeError as exc:
+        if is_claim_race_error(exc):
+            print(f"skip {rid}: route was claimed or started by another agent instance")
+            return False
+        raise
+    reply = mac_basic_status(route)
+    if not route_can_receive_reply(rid):
+        return False
+    try:
+        reply_args = ["reply", rid, "--reply-file", "-", "--agent-id", AGENT_ID, "--instance-id", INSTANCE_ID]
+        if lease_id:
+            reply_args.extend(["--lease-id", str(lease_id)])
+        print(json.dumps(run_json(reply_args, reply), ensure_ascii=False))
+    except RuntimeError as exc:
+        if is_reply_race_error(exc):
+            print(f"skip {rid}: route stopped accepting replies before reply write")
+            return False
+        raise
+    return True
+
+
+def push_routes_board() -> None:
+    """Render the unified route board on the VPS ledger and push it to the Mac
+    over FRP 6022 (VPS->Mac), so Huaguoshan's `ctx` shows the same board with
+    origin->executor. Best-effort; never breaks the claim loop."""
+    try:
+        r = subprocess.run([ROUTE_CTL, "routes", "--self", DEVICE_ID, "--limit", "25"],
+                           capture_output=True, text=True, timeout=20)
+        board = r.stdout or ""
+        if not board.strip():
+            return
+        cmd = [
+            "ssh", "-F", FRP_SSH_CONFIG, "-p", FRP_SSH_PORT,
+            "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+            frp_target(), "mkdir -p ~/ctx-pi && cat > ~/ctx-pi/routes-board.txt",
+        ]
+        subprocess.run(cmd, input=board, text=True, capture_output=True, timeout=15)
+    except Exception:
+        pass
+
+
+def run_once(retire_on_exit: bool = True, max_routes: int = 1) -> int:
+    limit = max(1, max_routes)
+    processed = 0
+    try:
+        run_json(["device-upsert", "--profile-file", "-"], device_profile())
+        agent_heartbeat("active")
+        push_routes_board()
+        routes = run_json(["list", "--status", "queued", "--target-site", DEVICE_ID, "--limit", "1000", "--json"])
+        if not isinstance(routes, list):
+            raise RuntimeError("unexpected route list payload")
+        for route in routes:
+            if process_route(route):
+                processed += 1
+                if processed >= limit:
+                    break
+        if processed:
+            print(f"processed {processed} huaguoshan-macos FRP route(s)")
+            return 0
+        print("no eligible huaguoshan-macos FRP routes")
+        return 0
+    finally:
+        if retire_on_exit:
+            agent_heartbeat("stopped")
+
+
+def run_loop(args: argparse.Namespace) -> int:
+    count = 0
+    try:
+        while True:
+            run_once(retire_on_exit=False, max_routes=args.max_routes_per_iteration)
+            count += 1
+            if args.iterations and count >= args.iterations:
+                return 0
+            time.sleep(args.interval)
+    finally:
+        agent_heartbeat("stopped")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="ctx-huaguoshan-frp-agent")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("profile")
+    once = sub.add_parser("once")
+    once.add_argument("--max-routes", type=int, default=1)
+    loop = sub.add_parser("loop")
+    loop.add_argument("--interval", type=int, default=30)
+    loop.add_argument("--iterations", type=int, default=0)
+    loop.add_argument("--max-routes-per-iteration", type=int, default=1)
+    args = parser.parse_args()
+    if args.cmd == "profile":
+        publish_profile()
+        return 0
+    if args.cmd == "once":
+        return run_once(max_routes=args.max_routes)
+    if args.cmd == "loop":
+        return run_loop(args)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

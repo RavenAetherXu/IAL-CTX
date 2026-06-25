@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""ctx-lease-reaper — auto-reclaim routes stranded on intermittent/crashed executors.
+
+neutral-hub spec §11.1 (freeze item #6, auto-reclaim). Closes Huaguoshan risk #2:
+without this, a capability-routed route claimed by an ephemeral pi session that
+then sleeps/dies stays `claimed`/`running` forever and no other executor can take
+it.
+
+ADDITIVE + engine-atomic by construction: it never edits route files. It only
+calls existing `ctx-route` verbs (`requeue`, `expire`) which run under the engine's
+`flock(LOCK_EX)` + lease guard. `requeue` without `--force` already refuses to
+touch a route whose lease has NOT expired, so the reaper cannot disturb a healthy
+active claim even if its own clock is skewed (double guard).
+
+Policy:
+  claimed/running route with EXPIRED lease:
+    retry_count <  max_retries  -> requeue (back to queued for re-dispatch)
+    retry_count >= max_retries  -> expire  (dead executor; stop the loop, leave evidence)
+  lease not expired -> leave alone.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+ROUTE_CTL = os.environ.get("CTX_ROUTE", str(SCRIPT_DIR / "ctx-route"))
+ACTIVE = ("claimed", "running")
+DEFAULT_MAX_RETRIES = 3
+
+
+def now() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def route_cmd(args: list[str], timeout: int = 30) -> tuple[int, str, str]:
+    r = subprocess.run([ROUTE_CTL, *args], text=True, capture_output=True, timeout=timeout)
+    return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
+
+
+def list_active() -> list[dict]:
+    out = []
+    for st in ACTIVE:
+        rc, so, se = route_cmd(["list", "--status", st, "--json", "--limit", "1000"])
+        if rc != 0:
+            print(f"[{now()}] list {st} failed: {se}", file=sys.stderr)
+            continue
+        try:
+            out.extend(json.loads(so) if so else [])
+        except json.JSONDecodeError:
+            pass
+    return out
+
+
+def lease_expired(route: dict, now_dt: dt.datetime) -> bool:
+    lease = route.get("lease") if isinstance(route.get("lease"), dict) else {}
+    exp = lease.get("expires_at")
+    if not exp:
+        return False  # no lease deadline -> not reapable by time
+    try:
+        t = dt.datetime.fromisoformat(exp.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return t < now_dt
+
+
+def reap_once(max_retries: int, dry_run: bool = False) -> tuple[int, int, int]:
+    now_dt = dt.datetime.now(dt.timezone.utc)
+    requeued = expired = skipped = 0
+    for route in list_active():
+        rid = route.get("route_id")
+        if not rid:
+            continue
+        if not lease_expired(route, now_dt):
+            skipped += 1
+            continue
+        retries = int(route.get("retry_count") or 0)
+        claimed_by = (route.get("lease") or {}).get("claimed_by", "?")
+        if retries >= max_retries:
+            action, reason = "expire", f"lease expired and retry_count={retries} >= max={max_retries}; executor presumed dead"
+        else:
+            action, reason = "requeue", f"lease expired on executor {claimed_by}; auto-reclaim for re-dispatch"
+        if dry_run:
+            print(f"[{now()}] DRY {action} {rid} ({reason})")
+            if action == "expire":
+                expired += 1
+            else:
+                requeued += 1
+            continue
+        rc, so, se = route_cmd([action, rid, "--by", "ctx-lease-reaper", "--reason", reason])
+        if rc == 0:
+            print(f"[{now()}] {action.upper()} {rid} (was claimed_by={claimed_by}, retry={retries})")
+            if action == "expire": expired += 1
+            else: requeued += 1
+        else:
+            # engine refused (e.g. lease became active again between list and call) -> safe skip
+            skipped += 1
+            if "lease has not expired" not in se:
+                print(f"[{now()}] {action} {rid} refused: {se}", file=sys.stderr)
+    return requeued, expired, skipped
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="ctx-lease-reaper")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("once", "doctor"):
+        sp = sub.add_parser(name)
+        sp.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
+        if name == "once":
+            sp.add_argument("--dry-run", action="store_true")
+    lp = sub.add_parser("loop")
+    lp.add_argument("--interval", type=float, default=60.0)
+    lp.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
+    args = ap.parse_args()
+
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
+    if args.cmd == "doctor":
+        active = list_active()
+        now_dt = dt.datetime.now(dt.timezone.utc)
+        stranded = [r for r in active if lease_expired(r, now_dt)]
+        print(json.dumps({"active_routes": len(active), "lease_expired_now": len(stranded),
+                          "max_retries": args.max_retries,
+                          "stranded_ids": [r.get("route_id") for r in stranded]},
+                         ensure_ascii=False, indent=2))
+        return 0
+    if args.cmd == "once":
+        rq, ex, sk = reap_once(args.max_retries, dry_run=args.dry_run)
+        print(f"requeued={rq} expired={ex} skipped={sk}")
+        return 0
+    # loop
+    print(f"[{now()}] ctx-lease-reaper loop interval={args.interval}s max_retries={args.max_retries}")
+    while True:
+        try:
+            rq, ex, sk = reap_once(args.max_retries)
+            if rq or ex:
+                print(f"[{now()}] reclaim cycle: requeued={rq} expired={ex}")
+        except Exception as exc:
+            print(f"[{now()}] reaper error: {exc}", file=sys.stderr)
+        time.sleep(args.interval)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

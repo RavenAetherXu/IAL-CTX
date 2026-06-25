@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+"""ctx-pi-worker — Huaguoshan (花果山 macOS) CTX pi executor.
+
+Runs ON the Mac, inside pi's own interactive permission context (started by the
+human, full TCC grants). It is deliberately *ledger-agnostic* and
+*network-agnostic*: it ONLY watches local directories under ~/ctx-pi.
+
+Topology:
+
+    Lingxiaodian (pi/Fable)                 Huaguoshan macOS (this worker)
+    ---------------------------             ------------------------------
+    ctx-huaguoshan-pi-bridge                ctx-pi-worker
+      claims route on local ledger            watches ~/ctx-pi/inbox
+      pushes task envelope  ───── FRP ─────▶  runs `pi -p` locally
+      polls ~/ctx-pi/outbox ◀──── FRP ─────   writes reply envelope
+      writes reply to CTX ledger
+
+Why this shape:
+  * FRP-first: every CTX ledger op stays on Lingxiaodian. The Mac never touches
+    the shared ledger and never needs public SSH back to the VPS.
+  * TCC-safe: the inbox/outbox live in $HOME (not the external volume where pi
+    is installed), so the FRP reverse-SSH push works, while the actual `pi`
+    execution happens in this worker's interactive context which *does* have
+    access to the volume.
+
+The worker is intentionally tiny and dependency-free (Python 3 stdlib only).
+
+Task envelope  (inbox/<route_id>.task.json), written by Lingxiaodian:
+    {
+      "schema": "ctx-pi-task-v1",
+      "route_id": "...", "trace_id": "...",
+      "origin": "lingxiaodian:fable",
+      "prompt": "the instruction for Huaguoshan pi",
+      "constraints": ["read_only_first", "no_secrets"],
+      "cwd": "~",                 # optional, where pi runs
+      "timeout_seconds": 600,     # optional
+      "pi_args": ["--tools", "read,grep,find,ls,bash"]  # optional passthrough
+    }
+
+Reply envelope (outbox/<route_id>.reply.json), written by this worker:
+    {
+      "schema": "ctx-pi-reply-v1",
+      "route_id": "...",
+      "status": "replied" | "failed",
+      "summary": "...",
+      "evidence": [{"kind": "pi-stdout-tail", "value": "..."}],
+      "residual_risk": "...",
+      "executed_by": "huaguoshan-macos:pi",
+      "exit_code": 0
+    }
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+BASE = Path(os.environ.get("CTX_PI_HOME", str(Path.home() / "ctx-pi")))
+INBOX = BASE / "inbox"
+PROCESSING = BASE / "processing"
+OUTBOX = BASE / "outbox"
+DONE = BASE / "done"
+LOGS = BASE / "logs"
+DEVICE = "huaguoshan-macos"
+AGENT_ID = "huaguoshan-macos:pi"
+MAX_TAIL = 3000
+STATUS_RE = re.compile(r"^CTX-REPLY-STATUS:\s*(ok|failed)\s*$", re.IGNORECASE | re.MULTILINE)
+
+
+def now() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def ensure_dirs() -> None:
+    for d in (INBOX, PROCESSING, OUTBOX, DONE, LOGS):
+        d.mkdir(parents=True, exist_ok=True)
+
+
+def find_pi() -> str | None:
+    explicit = os.environ.get("PI_BIN")
+    if explicit and Path(explicit).exists():
+        return explicit
+    found = shutil.which("pi")
+    if found:
+        return found
+    # Non-login shells often miss the interactive PATH; ask a login shell.
+    for shell in ("zsh", "bash"):
+        if shutil.which(shell):
+            try:
+                r = subprocess.run([shell, "-lc", "command -v pi"], text=True,
+                                   capture_output=True, timeout=15)
+                cand = (r.stdout or "").strip().splitlines()
+                if cand and Path(cand[-1]).exists():
+                    return cand[-1]
+            except Exception:
+                pass
+    for cand in ("/usr/local/bin/pi", str(Path.home() / ".local/bin/pi")):
+        if Path(cand).exists():
+            return cand
+    return None
+
+
+def atomic_write_json(path: Path, payload: dict) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def build_prompt(task: dict) -> str:
+    rid = task.get("route_id", "unknown")
+    origin = task.get("origin", "lingxiaodian")
+    constraints = task.get("constraints") or []
+    header = [
+        "CTX-ROUTE-WORKER",
+        f"You are the Huaguoshan (花果山 macOS) pi worker executing CTX route {rid}",
+        f"dispatched by {origin} through the ASC Context Engine.",
+        "",
+        "Operating rules for this route:",
+        "- Be metadata-first. Never print secret values, tokens, .env contents,",
+        "  private keys, or credential file bodies. Reference paths/IDs instead.",
+    ]
+    if "read_only_first" in constraints:
+        header.append("- Prefer read-only inspection before any mutation.")
+    if "no_secrets" in constraints:
+        header.append("- Treat this as a no-secrets route; redact anything sensitive.")
+    if constraints:
+        header.append(f"- Declared constraints: {', '.join(constraints)}")
+    header += [
+        "",
+        "When done, finish your reply with a single final line exactly:",
+        "    CTX-REPLY-STATUS: ok        (or: CTX-REPLY-STATUS: failed)",
+        "",
+        "TASK:",
+        str(task.get("prompt", "")).strip(),
+    ]
+    return "\n".join(header)
+
+
+def run_pi(pi_bin: str, task: dict, prompt: str) -> tuple[int, str, str, bool]:
+    rid = task.get("route_id", "task")
+    cwd = task.get("cwd") or str(Path.home())
+    cwd = os.path.expanduser(cwd)
+    timeout = int(task.get("timeout_seconds") or 600)
+    extra = task.get("pi_args") or []
+    if not isinstance(extra, list):
+        extra = []
+    cmd = [pi_bin, "-p", prompt, "--name", f"ctx:{rid}", *[str(a) for a in extra]]
+    timed_out = False
+    try:
+        r = subprocess.run(cmd, cwd=cwd if os.path.isdir(cwd) else None,
+                           text=True, capture_output=True, timeout=timeout,
+                           stdin=subprocess.DEVNULL)
+        return r.returncode, r.stdout or "", r.stderr or "", timed_out
+    except subprocess.TimeoutExpired as exc:
+        timed_out = True
+        out = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        err = exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        return 124, out, err, timed_out
+
+
+def tail(text: str, limit: int = MAX_TAIL) -> str:
+    text = text or ""
+    return text if len(text) <= limit else "…" + text[-limit:]
+
+
+def process_task(task_path: Path, pi_bin: str | None) -> bool:
+    rid = task_path.stem.replace(".task", "")
+    claimed = PROCESSING / task_path.name
+    try:
+        os.replace(task_path, claimed)  # atomic local claim
+    except FileNotFoundError:
+        return False  # another loop iteration took it
+    try:
+        task = json.loads(claimed.read_text(encoding="utf-8"))
+    except Exception as exc:
+        reply = base_reply(rid, "failed", f"task envelope unreadable: {exc}", exit_code=2)
+        write_reply(rid, reply)
+        os.replace(claimed, DONE / claimed.name)
+        return True
+
+    started = now()
+    if not pi_bin:
+        reply = base_reply(rid, "failed",
+                           "pi binary not found on Huaguoshan worker; set PI_BIN or fix PATH",
+                           exit_code=127)
+        reply["residual_risk"] = "Worker could not locate `pi`; no execution attempted."
+        write_reply(rid, reply)
+        os.replace(claimed, DONE / claimed.name)
+        return True
+
+    prompt = build_prompt(task)
+    print(f"[{now()}] executing route {rid} via {pi_bin}")
+    rc, out, err, timed_out = run_pi(pi_bin, task, prompt)
+
+    log_path = LOGS / f"{rid}.out.log"
+    log_path.write_text(
+        f"# route {rid}\n# started {started}\n# pi {pi_bin}\n# exit {rc} timed_out={timed_out}\n"
+        f"## STDOUT\n{out}\n\n## STDERR\n{err}\n",
+        encoding="utf-8",
+    )
+
+    m = STATUS_RE.findall(out)
+    declared_ok = bool(m) and m[-1].lower() == "ok"
+    if timed_out:
+        status = "failed"
+    elif m:
+        status = "replied" if declared_ok else "failed"
+    else:
+        status = "replied" if rc == 0 else "failed"
+
+    summary = first_summary(out) or (f"pi exited {rc}" if status == "failed" else "pi completed route")
+    reply = base_reply(rid, status, summary, exit_code=rc)
+    reply["started_at"] = started
+    reply["finished_at"] = now()
+    reply["timed_out"] = timed_out
+    reply["evidence"] = [
+        {"kind": "pi-stdout-tail", "value": tail(out)},
+        {"kind": "pi-worker-log", "path": str(log_path)},
+    ]
+    if err.strip():
+        reply["evidence"].append({"kind": "pi-stderr-tail", "value": tail(err, 1200)})
+    if status == "failed":
+        reply["residual_risk"] = (
+            "Huaguoshan pi run timed out." if timed_out
+            else "Huaguoshan pi reported/exited non-zero; review worker log."
+        )
+    write_reply(rid, reply)
+    os.replace(claimed, DONE / claimed.name)
+    print(f"[{now()}] route {rid} -> {status} (exit {rc})")
+    return True
+
+
+def first_summary(out: str) -> str:
+    # Prefer an explicit "SUMMARY:" line, else the last non-marker text line.
+    for line in out.splitlines():
+        s = line.strip()
+        if s.upper().startswith("SUMMARY:"):
+            return s[len("SUMMARY:"):].strip()[:600]
+    lines = [l.strip() for l in out.splitlines()
+             if l.strip() and not STATUS_RE.match(l.strip())]
+    return (lines[-1][:600] if lines else "")
+
+
+def base_reply(rid: str, status: str, summary: str, exit_code: int) -> dict:
+    return {
+        "schema": "ctx-pi-reply-v1",
+        "route_id": rid,
+        "status": status,
+        "summary": summary,
+        "evidence": [],
+        "artifacts": [],
+        "secret_events": [],
+        "residual_risk": "Executed by Huaguoshan pi in local interactive context.",
+        "next_action": "verify",
+        "executed_by": AGENT_ID,
+        "device": socket.gethostname(),
+        "replied_at": now(),
+        "exit_code": exit_code,
+    }
+
+
+def write_reply(rid: str, reply: dict) -> None:
+    atomic_write_json(OUTBOX / f"{rid}.reply.json", reply)
+
+
+def run_once() -> int:
+    pi_bin = find_pi()
+    processed = 0
+    for task_path in sorted(INBOX.glob("*.task.json")):
+        if process_task(task_path, pi_bin):
+            processed += 1
+    return processed
+
+
+def run_loop(interval: float) -> int:
+    print(f"[{now()}] ctx-pi-worker loop interval={interval}s base={BASE}")
+    pi_bin = find_pi()
+    print(f"[{now()}] pi binary: {pi_bin or 'NOT FOUND (set PI_BIN)'}")
+    while True:
+        try:
+            run_once()
+        except Exception as exc:  # never die on a single bad task
+            print(f"[{now()}] loop error: {exc}", file=sys.stderr)
+        time.sleep(interval)
+
+
+def main() -> int:
+    ensure_dirs()
+    p = argparse.ArgumentParser(prog="ctx-pi-worker")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("once", help="process current inbox tasks and exit")
+    lp = sub.add_parser("loop", help="continuously watch the inbox")
+    lp.add_argument("--interval", type=float, default=5.0)
+    sub.add_parser("doctor", help="report paths and pi discovery")
+    args = p.parse_args()
+
+    if args.cmd == "once":
+        n = run_once()
+        print(f"processed {n} task(s)")
+        return 0
+    if args.cmd == "loop":
+        return run_loop(args.interval)
+    if args.cmd == "doctor":
+        print(json.dumps({
+            "base": str(BASE), "inbox": str(INBOX), "outbox": str(OUTBOX),
+            "pi_bin": find_pi(), "device": socket.gethostname(),
+            "inbox_pending": len(list(INBOX.glob("*.task.json"))),
+        }, ensure_ascii=False, indent=2))
+        return 0
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

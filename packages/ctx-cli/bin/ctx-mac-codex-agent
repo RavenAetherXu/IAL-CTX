@@ -1,0 +1,529 @@
+#!/usr/bin/env python3
+"""Huaguoshan macOS CTX L2 Codex claimant.
+
+Manual-first agent that claims safe `target_site=huaguoshan-macos` Codex
+routes, invokes the local Codex CLI in read-only mode, and replies to the
+Lingxiaodian CTX route ledger. It is intentionally not installed as a launchd
+loop by default because each Codex route can spend model quota.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import platform
+import shlex
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+REMOTE = os.environ.get("CTX_REMOTE", "ctx-ledger@example.invalid")
+SSH_KEY = os.environ.get("CTX_SSH_KEY", str(Path.home() / ".ssh" / "ctx_ledger_key"))
+SSH_CONFIG = os.environ.get("CTX_SSH_CONFIG", "/dev/null")
+SSH_ATTEMPTS = int(os.environ.get("CTX_SSH_ATTEMPTS", "3"))
+SSH_RETRY_SECONDS = float(os.environ.get("CTX_SSH_RETRY_SECONDS", "2"))
+REMOTE_CTL = os.environ.get("CTX_ROUTE", "ctx-route")
+CODEX_BIN = os.environ.get("CTX_MAC_CODEX", "/Applications/Codex.app/Contents/Resources/codex")
+DEVICE_ID = os.environ.get("CTX_DEVICE_ID", "huaguoshan-macos")
+# R-D7 decoupled: identity is env-overridable (stable agent_key + mutable agent_id)
+# per CTX-FROZEN-CONTRACT-v1 §2; changing engine no longer requires a code edit.
+AGENT_KEY = os.environ.get("CTX_AGENT_KEY", "huaguoshan/codex-bridge")
+AGENT_ID = os.environ.get("CTX_AGENT_ID", "huaguoshan-macos:codex")
+STARTED_AT = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+INSTANCE_ID = os.environ.get("CTX_AGENT_INSTANCE_ID", f"{socket.gethostname()}:{os.getpid()}:{STARTED_AT}")
+SSH_METRICS: list[dict[str, object]] = []
+MAX_METRIC_EVENTS = 8
+WORKDIR = os.environ.get("CTX_MAC_CODEX_WORKDIR", str(Path.home()))
+EVIDENCE_DIR = Path(os.environ.get(
+    "CTX_MAC_CODEX_EVIDENCE_DIR",
+    str(Path.home() / ".local" / "state" / "asc-context-engine" / "codex-evidence"),
+))
+PERSIST_SESSION = os.environ.get("CTX_MAC_CODEX_PERSIST_SESSION", "").lower() in {"1", "true", "yes"}
+
+CAPABILITIES = {
+    "macos",
+    "codex",
+    "codex-cli",
+    "ctx-l2",
+    "read-only-inspect",
+    "review",
+    "handoff",
+    "metadata-only",
+}
+ALLOWED_CONSTRAINTS = {
+    "read_only_first",
+    "no_secrets",
+    "metadata_only",
+    "no_system_mutation",
+    "no_service_mutation",
+    "no_file_mutation",
+}
+ALLOWED_TASK_KINDS = {"inspect", "review", "verify", "handoff"}
+# R-D6 decoupled: target_agent is advisory (CTX-FROZEN-CONTRACT-v1 §4). Routing is
+# by capability (required ⊆ CAPABILITIES below), not by a hardcoded name whitelist.
+ADVISORY_TARGET_AGENTS = {"codex", "ctx-codex", "capability", ""}
+ALLOWED_CWD_PREFIXES = tuple(
+    item
+    for item in os.environ.get("CTX_MAC_CODEX_ALLOWED_CWD_PREFIXES", os.pathsep.join((WORKDIR, "/tmp"))).split(os.pathsep)
+    if item
+)
+BLOCKED_CWD_PARTS = (
+    "/.ssh",
+    "/.codex",
+    "/.factory",
+    "/.deepseek",
+    "/.config",
+    "/Library/Keychains",
+)
+TRANSIENT_SSH_ERRORS = (
+    "Operation timed out",
+    "Connection timed out",
+    "Connection reset",
+    "Connection closed",
+    "Connection refused",
+    "kex_exchange_identification",
+)
+
+
+def now() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def code_fingerprint(path: Path) -> dict[str, str]:
+    try:
+        data = path.read_bytes()
+        mtime = dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc).replace(microsecond=0)
+        return {
+            "path": str(path),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "mtime": mtime.isoformat().replace("+00:00", "Z"),
+        }
+    except Exception as exc:
+        return {"path": str(path), "error": str(exc)[:200]}
+
+
+LOADED_CODE = code_fingerprint(Path(__file__).resolve())
+
+
+def code_fingerprint_args() -> list[str]:
+    current = code_fingerprint(Path(__file__).resolve())
+    args = ["--tool-path", current["path"]]
+    if current.get("sha256"):
+        args.extend(["--tool-sha256", current["sha256"], "--tool-mtime", current.get("mtime", "")])
+    else:
+        args.extend(["--tool-error", current.get("error", "")])
+    if LOADED_CODE.get("sha256"):
+        args.extend([
+            "--loaded-tool-sha256",
+            LOADED_CODE["sha256"],
+            "--loaded-tool-mtime",
+            LOADED_CODE.get("mtime", ""),
+        ])
+    return args
+
+
+def record_metric(operation: str, elapsed_ms: int, ok: bool, attempts: int) -> None:
+    SSH_METRICS.append({
+        "operation": operation,
+        "elapsed_ms": elapsed_ms,
+        "ok": ok,
+        "attempts": attempts,
+        "observed_at": now(),
+    })
+
+
+def metrics_snapshot() -> dict:
+    events = SSH_METRICS[-MAX_METRIC_EVENTS:]
+    elapsed = [int(event.get("elapsed_ms") or 0) for event in SSH_METRICS]
+    return {
+        "schema": "ctx-agent-route-metrics-v1",
+        "call_count": len(SSH_METRICS),
+        "failed_call_count": sum(1 for event in SSH_METRICS if not event.get("ok")),
+        "total_elapsed_ms": sum(elapsed),
+        "max_elapsed_ms": max(elapsed) if elapsed else 0,
+        "recent": events,
+    }
+
+
+def metrics_args() -> list[str]:
+    return ["--metrics-json", json.dumps(metrics_snapshot(), ensure_ascii=False, separators=(",", ":"))]
+
+
+def is_transient_ssh_error(text: str) -> bool:
+    return any(marker in text for marker in TRANSIENT_SSH_ERRORS)
+
+
+def ssh_json(args: list[str], input_obj: dict | None = None, timeout: int = 45) -> object:
+    remote_command = " ".join(shlex.quote(part) for part in [REMOTE_CTL, *args])
+    cmd = [
+        "ssh",
+        "-F",
+        SSH_CONFIG,
+        "-i",
+        SSH_KEY,
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=10",
+        REMOTE,
+        remote_command,
+    ]
+    data = json.dumps(input_obj, ensure_ascii=False) if input_obj is not None else None
+    last_error = "ssh command failed"
+    operation = args[0] if args else "unknown"
+    started = time.monotonic()
+    attempts_used = 0
+    for attempt in range(1, max(1, SSH_ATTEMPTS) + 1):
+        attempts_used = attempt
+        try:
+            result = subprocess.run(cmd, input=data, text=True, capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            last_error = "ssh command timed out"
+            if attempt < max(1, SSH_ATTEMPTS):
+                time.sleep(SSH_RETRY_SECONDS * attempt)
+                continue
+            record_metric(operation, int((time.monotonic() - started) * 1000), False, attempts_used)
+            raise
+        if result.returncode == 0:
+            record_metric(operation, int((time.monotonic() - started) * 1000), True, attempts_used)
+            out = (result.stdout or "").strip()
+            if not out:
+                return None
+            return json.loads(out)
+        last_error = (result.stderr or result.stdout or "ssh command failed").strip()
+        if attempt < max(1, SSH_ATTEMPTS) and is_transient_ssh_error(last_error):
+            time.sleep(SSH_RETRY_SECONDS * attempt)
+            continue
+        break
+    record_metric(operation, int((time.monotonic() - started) * 1000), False, attempts_used or 1)
+    raise RuntimeError(last_error)
+
+
+def is_claim_race_error(exc: Exception) -> bool:
+    text = str(exc)
+    return "route not claimable:" in text or "route cannot start from status=" in text
+
+
+def safe_cwd(route: dict) -> str:
+    requested = route.get("cwd") or WORKDIR
+    path = os.path.abspath(str(requested))
+    if any(part in path for part in BLOCKED_CWD_PARTS):
+        raise ValueError(f"blocked cwd: {path}")
+    if not any(path == prefix or path.startswith(prefix + "/") for prefix in ALLOWED_CWD_PREFIXES):
+        raise ValueError(f"cwd outside allowed prefixes: {path}")
+    if not os.path.isdir(path):
+        raise ValueError(f"cwd does not exist: {path}")
+    return path
+
+
+def device_profile() -> dict:
+    return {
+        "device_id": DEVICE_ID,
+        "site": "huaguoshan",
+        "os": "macos",
+        "availability": "intermittent-home-device",
+        "agents": ["local-native", "codex"],
+        "capabilities": sorted(CAPABILITIES | {"local-shell", "read-only-probe", "ctx-l2-smoke"}),
+        "transports": ["ssh-to-lingxiaodian", "frp-return-link"],
+        "health": "up",
+        "hostname": socket.gethostname(),
+        "platform": platform.platform(),
+        "red_lines": [
+            "no_key_copy",
+            "no_sudo_without_approval",
+            "read_only_first",
+            "no_unrestricted_remote_shell",
+            "codex_quota_sensitive",
+        ],
+    }
+
+
+def publish_profile() -> None:
+    print(json.dumps(ssh_json(["device-upsert", "--profile-file", "-"], device_profile()), ensure_ascii=False))
+    print(json.dumps(agent_heartbeat("profile"), ensure_ascii=False))
+
+
+def agent_heartbeat(state: str = "active") -> object:
+    return ssh_json([
+        "agent-heartbeat",
+        "--device-id",
+        DEVICE_ID,
+        "--agent-id",
+        AGENT_ID,
+        "--instance-id",
+        INSTANCE_ID,
+        "--pid",
+        str(os.getpid()),
+        "--hostname",
+        socket.gethostname(),
+        "--started-at",
+        STARTED_AT,
+        "--role",
+        "huaguoshan-manual-first-codex-claimant",
+        "--state",
+        state,
+        *code_fingerprint_args(),
+        *metrics_args(),
+    ])
+
+
+def agent_retire() -> object:
+    return agent_heartbeat("stopped")
+
+
+def route_eligible(route: dict) -> tuple[bool, str]:
+    if route.get("target_site") != DEVICE_ID:
+        return False, "target_site mismatch"
+    target_agent = route.get("target_agent") or ""
+    if target_agent and target_agent not in ADVISORY_TARGET_AGENTS and target_agent != AGENT_ID:
+        return False, "target_agent names a different agent"
+    if route.get("status") != "queued":
+        return False, "status is not queued"
+    if route.get("approval_required"):
+        return False, "approval required"
+    if route.get("secret_capabilities"):
+        return False, "secret capabilities present"
+    required = set(route.get("required_capabilities") or [])
+    if not required.issubset(CAPABILITIES):
+        return False, "required capabilities not available"
+    constraints = set(route.get("constraints") or [])
+    if not constraints.issubset(ALLOWED_CONSTRAINTS):
+        return False, "constraints outside safe allowlist"
+    if route.get("task_kind") not in ALLOWED_TASK_KINDS:
+        return False, "task_kind requires human approval"
+    try:
+        safe_cwd(route)
+    except ValueError as exc:
+        return False, str(exc)
+    return True, "eligible"
+
+
+def route_task(route: dict) -> str:
+    identity = {
+        "trace_id": route.get("trace_id") or route.get("route_id"),
+        "route_id": route.get("route_id"),
+        "lane_id": route.get("lane_id"),
+        "work_chat_id": route.get("work_chat_id"),
+        "context_id": route.get("context_id"),
+        "executor_site": "huaguoshan-macos",
+        "executor_agent": "codex",
+        "origin_site": route.get("origin_site"),
+        "origin_agent": route.get("origin_agent"),
+        "target_site": route.get("target_site"),
+        "target_agent": route.get("target_agent"),
+        "task_kind": route.get("task_kind"),
+        "session_visibility": "persisted" if PERSIST_SESSION else "ephemeral",
+        "constraints": route.get("constraints") or [],
+    }
+    route_view = {
+        "route_id": route.get("route_id"),
+        "origin_site": route.get("origin_site"),
+        "origin_agent": route.get("origin_agent"),
+        "target_site": route.get("target_site"),
+        "target_agent": route.get("target_agent"),
+        "task_kind": route.get("task_kind"),
+        "title": route.get("title_auto") or route.get("title_original"),
+        "constraints": route.get("constraints") or [],
+        "required_capabilities": route.get("required_capabilities") or [],
+        "reply_to": route.get("reply_to"),
+    }
+    instructions = route.get("instructions") or route.get("title_original") or route.get("title_auto")
+    return f"""Handle this CTX L2 route as Huaguoshan macOS Codex.
+
+CTX-CALL-IDENTITY:
+{json.dumps(identity, ensure_ascii=False, indent=2)}
+
+Route metadata:
+{json.dumps(route_view, ensure_ascii=False, indent=2)}
+
+Task instructions:
+{instructions}
+
+Safety requirements:
+- Stay within the route instructions and produce a direct final answer.
+- Do not read or print secrets, tokens, auth files, private keys, .env files, or credential configs.
+- Do not mutate files, launchd, SSH, FRP, proxy, Docker, package manager, or system settings.
+- Prefer no tool use unless the route explicitly requires read-only local inspection.
+- Include concise evidence, assumptions, and residual risk in your final answer.
+
+At the end of your final answer, include:
+CTX-ROUTE-ID: {route.get("route_id")}
+CTX-EXECUTOR: huaguoshan-macos:codex
+CTX-SESSION-VISIBILITY: {"persisted" if PERSIST_SESSION else "ephemeral"}
+"""
+
+
+def codex_output_path(route_id: str) -> Path:
+    safe_id = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in route_id)
+    return EVIDENCE_DIR / f"{safe_id}.last-message.txt"
+
+
+def codex_command(route: dict, output_path: Path) -> list[str]:
+    cmd = [
+        CODEX_BIN,
+        "exec",
+        "--sandbox",
+        "read-only",
+        "--skip-git-repo-check",
+        "--cd",
+        safe_cwd(route),
+        "-o",
+        str(output_path),
+        "-",
+    ]
+    if not PERSIST_SESSION:
+        cmd.insert(4, "--ephemeral")
+    return cmd
+
+
+def read_text_tail(path: Path, limit: int = 4000) -> str:
+    if not path.exists():
+        return ""
+    text = path.read_text(encoding="utf-8", errors="replace").strip()
+    return text[-limit:]
+
+
+def run_codex(route: dict, timeout: int) -> dict:
+    EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = codex_output_path(route["route_id"])
+    prompt = route_task(route)
+    started = now()
+    result = subprocess.run(
+        codex_command(route, output_path),
+        input=prompt,
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+    )
+    final_message = read_text_tail(output_path)
+    stdout_tail = ((result.stdout or "") + (("\n[stderr]\n" + result.stderr) if result.stderr else "")).strip()[-2000:]
+    summary = final_message or stdout_tail or "Codex produced no final message."
+    reply_status = "replied" if result.returncode == 0 and final_message else "failed"
+    return {
+        "route_id": route["route_id"],
+        "status": reply_status,
+        "replied_at": now(),
+        "executed_by": AGENT_ID,
+        "summary": summary[:3000],
+        "evidence": [
+            {
+                "kind": "codex-cli-exec",
+                "value": "codex exec --sandbox read-only --ephemeral",
+                "exit_code": result.returncode,
+                "observed_at": started,
+                "output_path": str(output_path),
+                "session_visibility": "persisted" if PERSIST_SESSION else "ephemeral",
+                "stdout_tail": stdout_tail[-1000:],
+            }
+        ],
+        "artifacts": [{"kind": "codex-last-message", "path": str(output_path)}],
+        "secret_events": [],
+        "residual_risk": "Mac Codex output was captured from the final-message file; this route does not prove long-running quota availability.",
+        "next_action": "verify",
+    }
+
+
+def process_route(route: dict, timeout: int) -> bool:
+    eligible, reason = route_eligible(route)
+    if not eligible:
+        print(f"skip {route.get('route_id')}: {reason}")
+        return False
+    rid = route["route_id"]
+    print(f"claiming {rid}: {route.get('title_auto')}")
+    try:
+        claim_resp = ssh_json([
+            "claim",
+            rid,
+            "--device-id",
+            DEVICE_ID,
+            "--agent-id",
+            AGENT_ID,
+            "--instance-id",
+            INSTANCE_ID,
+            "--lease-seconds",
+            str(timeout + 300),
+        ])
+        # CTX engine (post-2026-06) enforces lease ownership on start/reply.
+        # Capture the lease_id from claim and thread agent/instance/lease ids
+        # through start + reply so this client matches the evolved engine.
+        lease_id = ""
+        if isinstance(claim_resp, dict):
+            lease_id = claim_resp.get("lease_id") or (claim_resp.get("lease") or {}).get("lease_id") or ""
+        start_args = ["start", rid, "--agent-id", AGENT_ID, "--instance-id", INSTANCE_ID]
+        if lease_id:
+            start_args += ["--lease-id", lease_id]
+        ssh_json(start_args)
+    except RuntimeError as exc:
+        if is_claim_race_error(exc):
+            print(f"skip {rid}: route was claimed or started by another agent instance")
+            return False
+        raise
+    reply = run_codex(route, timeout)
+    reply_args = ["reply", rid, "--reply-file", "-", "--agent-id", AGENT_ID, "--instance-id", INSTANCE_ID]
+    if lease_id:
+        reply_args += ["--lease-id", lease_id]
+    print(json.dumps(ssh_json(reply_args, reply), ensure_ascii=False))
+    return True
+
+
+def run_once(args: argparse.Namespace, retire_on_exit: bool = True) -> int:
+    try:
+        ssh_json(["device-upsert", "--profile-file", "-"], device_profile())
+        agent_heartbeat("active")
+        # R-D6 decoupled: fetch by target_site only; do NOT pre-filter by a hardcoded
+        # target_agent name. route_eligible() decides by capability (advisory target).
+        routes = ssh_json(["list", "--status", "queued", "--target-site", DEVICE_ID, "--json"])
+        if not isinstance(routes, list):
+            raise RuntimeError("unexpected route list payload")
+        for route in routes:
+            if process_route(route, args.timeout):
+                return 0
+        print("no eligible huaguoshan-macos codex routes")
+        return 0
+    finally:
+        if retire_on_exit:
+            agent_retire()
+
+
+def run_loop(args: argparse.Namespace) -> int:
+    count = 0
+    try:
+        while True:
+            run_once(args, retire_on_exit=False)
+            count += 1
+            if args.iterations and count >= args.iterations:
+                return 0
+            time.sleep(args.interval)
+    finally:
+        agent_retire()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="ctx-mac-codex-agent")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("profile")
+    once = sub.add_parser("once")
+    once.add_argument("--timeout", type=int, default=300)
+    loop = sub.add_parser("loop")
+    loop.add_argument("--timeout", type=int, default=300)
+    loop.add_argument("--interval", type=int, default=60)
+    loop.add_argument("--iterations", type=int, default=0)
+    args = parser.parse_args()
+    if args.cmd == "profile":
+        publish_profile()
+        return 0
+    if args.cmd == "once":
+        return run_once(args)
+    if args.cmd == "loop":
+        return run_loop(args)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

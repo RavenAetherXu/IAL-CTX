@@ -1,0 +1,502 @@
+#!/usr/bin/env python3
+"""ctx-hgs — Huaguoshan (花果山 macOS) local Context Engine dashboard.
+
+The Huaguoshan side of CTX is a *ledger-agnostic*, *network-agnostic* file
+queue driven by `ctx-pi-worker` (com.asc.ctx-pi-worker launchd agent). It never
+touches the Lingxiaodian ledger; it only watches local directories under
+~/ctx-pi:
+
+    inbox/      tasks pushed in by Lingxiaodian, waiting to run   -> queued
+    processing/ claimed by the worker, executor running now       -> running
+    outbox/     reply envelopes written back by the worker        -> reply
+    done/       task envelopes after a reply was written          -> finished
+
+This is the 花果山 analogue of Lingxiaodian's `ctx` (-> ctx-codex status):
+`ctx` with no args prints the local status dashboard; subcommands drill down.
+
+Pure Python 3 stdlib, no deps. Read-only: never mutates the queue.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+from pathlib import Path
+
+BASE = Path(os.environ.get("CTX_PI_HOME", str(Path.home() / "ctx-pi")))
+INBOX = BASE / "inbox"
+PROCESSING = BASE / "processing"
+OUTBOX = BASE / "outbox"
+DONE = BASE / "done"
+# Unified cross-device route board, pushed from the Lingxiaodian ledger over FRP.
+ROUTES_BOARD = BASE / "routes-board.txt"
+LOGS = BASE / "logs"
+LAUNCHD_LOG = LOGS / "launchd.out.log"
+WORKER_LABEL = "com.asc.ctx-pi-worker"
+EXEC_RE = re.compile(r"\[([0-9TZ:\-]+)\] executing route (\S+)")
+DONE_RE = re.compile(r"\[([0-9TZ:\-]+)\] route (\S+) -> (\w+)")
+
+
+# ---------------------------------------------------------------- ANSI colors
+def _supports_color() -> bool:
+    return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+COLOR = _supports_color()
+
+
+def c(text: str, code: str) -> str:
+    if not COLOR:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def bold(t): return c(t, "1")
+def dim(t): return c(t, "2")
+def green(t): return c(t, "32")
+def yellow(t): return c(t, "33")
+def red(t): return c(t, "31")
+def cyan(t): return c(t, "36")
+def blue(t): return c(t, "34")
+
+
+STATUS_STYLE = {
+    "queued": yellow,
+    "running": cyan,
+    "replied": green,
+    "failed": red,
+    "verified": green,
+    "unknown": dim,
+}
+
+
+# ---------------------------------------------------------------- time helpers
+def now_utc() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def parse_z(ts: str | None) -> dt.datetime | None:
+    if not ts:
+        return None
+    try:
+        return dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def ago(ts: dt.datetime | None) -> str:
+    if ts is None:
+        return ""
+    delta = now_utc() - ts
+    s = int(delta.total_seconds())
+    if s < 0:
+        return "just now"
+    if s < 60:
+        return f"{s}s ago"
+    if s < 3600:
+        return f"{s // 60}m ago"
+    if s < 86400:
+        return f"{s // 3600}h {(s % 3600) // 60}m ago"
+    return f"{s // 86400}d ago"
+
+
+def local_hm(ts: dt.datetime | None) -> str:
+    if ts is None:
+        return "?"
+    return ts.astimezone().strftime("%m-%d %H:%M")
+
+
+# ---------------------------------------------------------------- data loading
+def load_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+
+def first_line(text: str, limit: int = 64) -> str:
+    line = (text or "").strip().splitlines()[0] if (text or "").strip() else ""
+    line = line.strip()
+    if len(line) > limit:
+        line = line[: limit - 1] + "…"
+    return line
+
+
+def parse_launchd_log() -> dict[str, dict]:
+    """route_id -> {started, finished, result} from launchd.out.log."""
+    events: dict[str, dict] = {}
+    if not LAUNCHD_LOG.exists():
+        return events
+    for ln in LAUNCHD_LOG.read_text(errors="replace").splitlines():
+        m = EXEC_RE.search(ln)
+        if m:
+            ts, rid = m.group(1), m.group(2)
+            events.setdefault(rid, {})["started"] = parse_z(ts)
+            continue
+        m = DONE_RE.search(ln)
+        if m:
+            ts, rid, res = m.group(1), m.group(2), m.group(3)
+            ev = events.setdefault(rid, {})
+            ev["finished"] = parse_z(ts)
+            ev["result"] = res
+    return events
+
+
+def collect_tasks() -> list[dict]:
+    """One record per route_id across all queue dirs."""
+    log_events = parse_launchd_log()
+    tasks: dict[str, dict] = {}
+
+    def ensure(rid: str) -> dict:
+        return tasks.setdefault(rid, {"route_id": rid})
+
+    # task envelopes
+    for loc, d in (("inbox", INBOX), ("processing", PROCESSING), ("done", DONE)):
+        for p in d.glob("*.task.json"):
+            rid = p.name[: -len(".task.json")]
+            rec = ensure(rid)
+            rec["location"] = loc
+            rec["task_path"] = p
+            env = load_json(p)
+            rec["origin"] = env.get("origin", "")
+            rec["prompt"] = env.get("prompt", "")
+            rec["pushed_at"] = parse_z(env.get("pushed_at"))
+            rec["timeout_seconds"] = env.get("timeout_seconds")
+
+    # replies
+    for p in OUTBOX.glob("*.reply.json"):
+        rid = p.name[: -len(".reply.json")]
+        rec = ensure(rid)
+        rep = load_json(p)
+        rec["reply_path"] = p
+        rec["reply_status"] = rep.get("status")
+        rec["reply_summary"] = rep.get("summary", "")
+        rec["exit_code"] = rep.get("exit_code")
+        rec["timed_out"] = rep.get("timed_out")
+        rec["started_at"] = parse_z(rep.get("started_at"))
+        rec["finished_at"] = parse_z(rep.get("finished_at"))
+        rec["replied_at"] = parse_z(rep.get("replied_at"))
+        rec["next_action"] = rep.get("next_action")
+
+    # fold in launchd timeline + derive status
+    for rid, rec in tasks.items():
+        ev = log_events.get(rid, {})
+        rec.setdefault("started_at", ev.get("started"))
+        if rec.get("started_at") is None:
+            rec["started_at"] = ev.get("started")
+        rec["log_result"] = ev.get("result")
+        rec["status"] = derive_status(rec)
+        rec["sort_ts"] = (
+            rec.get("replied_at")
+            or rec.get("finished_at")
+            or rec.get("started_at")
+            or rec.get("pushed_at")
+            or extract_ts_from_rid(rid)
+        )
+
+    out = list(tasks.values())
+    out.sort(key=lambda r: r.get("sort_ts") or dt.datetime.min.replace(tzinfo=dt.timezone.utc), reverse=True)
+    return out
+
+
+def extract_ts_from_rid(rid: str) -> dt.datetime | None:
+    m = re.search(r"(\d{8}T\d{6}Z)", rid)
+    if not m:
+        return None
+    try:
+        return dt.datetime.strptime(m.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=dt.timezone.utc)
+    except ValueError:
+        return None
+
+
+def derive_status(rec: dict) -> str:
+    loc = rec.get("location")
+    rep = rec.get("reply_status")
+    if loc == "inbox":
+        return "queued"
+    if loc == "processing" and not rep:
+        return "running"
+    if rep == "replied":
+        return "verified" if rec.get("next_action") == "verified" else "replied"
+    if rep == "failed":
+        return "failed"
+    if loc == "done":
+        return rec.get("log_result") or "replied"
+    return "unknown"
+
+
+# ---------------------------------------------------------------- worker probe
+def worker_status() -> tuple[str, str]:
+    """(state, pid) for the launchd worker agent."""
+    uid = os.getuid()
+    try:
+        out = subprocess.run(
+            ["launchctl", "print", f"gui/{uid}/{WORKER_LABEL}"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except Exception:
+        return ("unknown", "?")
+    state = "?"
+    pid = "?"
+    for ln in out.splitlines():
+        s = ln.strip()
+        if s.startswith("state = "):
+            state = s.split("=", 1)[1].strip()
+        elif s.startswith("pid = "):
+            pid = s.split("=", 1)[1].strip()
+    if pid == "?":
+        return ("not running", "-")
+    return (state, pid)
+
+
+# ---------------------------------------------------------------- rendering
+def status_label(st: str) -> str:
+    style = STATUS_STYLE.get(st, dim)
+    return style(f"{st:<9}")
+
+
+def task_oneline(idx: int, rec: dict) -> str:
+    rid = rec["route_id"]
+    st = rec["status"]
+    title = first_line(rec.get("prompt", ""), 54) or dim("(no prompt)")
+    origin = rec.get("origin", "") or "?"
+    when = local_hm(rec.get("sort_ts"))
+    age = ago(rec.get("sort_ts"))
+    extra = ""
+    if st == "running":
+        started = rec.get("started_at")
+        to = rec.get("timeout_seconds")
+        run_for = ago(started).replace(" ago", "") if started else "?"
+        extra = dim(f" run={run_for}" + (f"/{to}s" if to else ""))
+    elif rec.get("timed_out"):
+        extra = red(" TIMED-OUT")
+    elif rec.get("exit_code") not in (0, None):
+        extra = red(f" exit={rec.get('exit_code')}")
+    num = dim(f"{idx:>2}.")
+    return (f"{num} {status_label(st)} {dim(when)} {bold(rid)}\n"
+            f"      {title}\n"
+            f"      {dim('origin=' + origin)}  {dim(age)}{extra}")
+
+
+def cmd_status(args: list[str]) -> int:
+    host = socket.gethostname()
+    state, pid = worker_status()
+    tasks = collect_tasks()
+
+    counts = {"inbox": len(list(INBOX.glob("*.task.json"))),
+              "processing": len(list(PROCESSING.glob("*.task.json"))),
+              "outbox": len(list(OUTBOX.glob("*.reply.json"))),
+              "done": len(list(DONE.glob("*.task.json")))}
+
+    by_status: dict[str, int] = {}
+    for r in tasks:
+        by_status[r["status"]] = by_status.get(r["status"], 0) + 1
+
+    print(bold("CTX Context Engine — 花果山 / Huaguoshan (local executor adapter)"))
+    print(f"host: {cyan(host)}")
+    print(f"base: {BASE}")
+    wstyle = green if state == "running" else (red if state in ("not running", "?") else yellow)
+    print(f"worker: {WORKER_LABEL} {wstyle(state)} pid={pid}")
+    print()
+
+    print(bold("Queue"))
+    print(f"- inbox(queued)={counts['inbox']} "
+          f"processing(running)={counts['processing']} "
+          f"outbox(replies)={counts['outbox']} "
+          f"done(finished)={counts['done']}")
+    if by_status:
+        summary = "  ".join(f"{STATUS_STYLE.get(k, dim)(k)}={v}" for k, v in sorted(by_status.items()))
+        print(f"- {summary}")
+    print()
+
+    # Unified cross-device route board (same view as Lingxiaodian `ctx-route routes`),
+    # pushed from the single VPS ledger over FRP. Shows 发起(origin)->执行(executor).
+    print(bold("\u8de8\u8bbe\u5907\u901a\u884c\u8bb0\u5f55 (\u7edf\u4e00\u770b\u677f \u00b7 \u53d1\u8d77 origin \u2192 \u6267\u884c executor)"))
+    if ROUTES_BOARD.exists():
+        mt = dt.datetime.fromtimestamp(ROUTES_BOARD.stat().st_mtime, dt.timezone.utc)
+        for ln in ROUTES_BOARD.read_text(errors="replace").rstrip().splitlines():
+            print("  " + ln)
+        print(dim("  (snapshot from Lingxiaodian \u8d26\u672c, " + ago(mt) + "; \u2605=\u672c\u7aef\u82b1\u679c\u5c71\u53d1\u8d77)"))
+    else:
+        print(dim("  (\u770b\u677f\u5c1a\u672a\u63a8\u9001; VPS \u7aef FRP loop \u4f1a\u63a8 ~/ctx-pi/routes-board.txt)"))
+    print()
+
+    limit = 8
+    for a in args:
+        if a.isdigit():
+            limit = int(a)
+        if a in ("-a", "--all"):
+            limit = len(tasks)
+    print(bold(f"\u672c\u673a pi-worker Tasks (latest first, showing {min(limit, len(tasks))}/{len(tasks)})"))
+    if not tasks:
+        print(dim("  (no tasks yet)"))
+    for i, rec in enumerate(tasks[:limit], 1):
+        print(task_oneline(i, rec))
+    print()
+
+    print(bold("Recent worker log"))
+    if LAUNCHD_LOG.exists():
+        lines = LAUNCHD_LOG.read_text(errors="replace").splitlines()[-5:]
+        for ln in lines:
+            print(dim("  " + ln))
+    else:
+        print(dim("  (no launchd log)"))
+    print()
+
+    print(bold("Commands"))
+    print(dim("- ctx                 this dashboard"))
+    print(dim("- ctx tasks [N|-a]    list tasks (default 20)"))
+    print(dim("- ctx show <id|N>     task envelope + reply + summary"))
+    print(dim("- ctx log <id|N>      executor stdout log for a route"))
+    print(dim("- ctx watch           live-tail the worker loop log"))
+    print(dim("- (\u8de8\u8bbe\u5907\u8def\u7531\u770b\u677f\u7531\u51cc\u9704\u6bbf FRP loop \u63a8\u9001; \u4ea6\u53ef\u5728\u51cc\u9704\u6bbf\u8dd1 `ctx-route routes`)"))
+    return 0
+
+
+def resolve_task(ref: str, tasks: list[dict]) -> dict | None:
+    if ref.isdigit():
+        i = int(ref)
+        if 1 <= i <= len(tasks):
+            return tasks[i - 1]
+        return None
+    for r in tasks:
+        if r["route_id"] == ref:
+            return r
+    for r in tasks:  # substring match
+        if ref in r["route_id"]:
+            return r
+    return None
+
+
+def cmd_tasks(args: list[str]) -> int:
+    tasks = collect_tasks()
+    limit = 20
+    for a in args:
+        if a.isdigit():
+            limit = int(a)
+        if a in ("-a", "--all"):
+            limit = len(tasks)
+    print(bold(f"Tasks (latest first, {min(limit, len(tasks))}/{len(tasks)})\n"))
+    for i, rec in enumerate(tasks[:limit], 1):
+        print(task_oneline(i, rec))
+    return 0
+
+
+def cmd_show(args: list[str]) -> int:
+    if not args:
+        print(red("usage: ctx show <id|N>"), file=sys.stderr)
+        return 2
+    tasks = collect_tasks()
+    rec = resolve_task(args[0], tasks)
+    if not rec:
+        print(red(f"no task matching '{args[0]}'"), file=sys.stderr)
+        return 1
+    print(bold(rec["route_id"]))
+    print(f"status:     {status_label(rec['status']).strip()}")
+    print(f"location:   {rec.get('location', '?')}")
+    print(f"origin:     {rec.get('origin', '?')}")
+    print(f"pushed:     {local_hm(rec.get('pushed_at'))}  ({ago(rec.get('pushed_at'))})")
+    print(f"started:    {local_hm(rec.get('started_at'))}  ({ago(rec.get('started_at'))})")
+    if rec.get("finished_at") or rec.get("replied_at"):
+        ft = rec.get("finished_at") or rec.get("replied_at")
+        print(f"finished:   {local_hm(ft)}  ({ago(ft)})")
+    if rec.get("exit_code") is not None:
+        print(f"exit_code:  {rec.get('exit_code')}  timed_out={rec.get('timed_out')}")
+    print()
+    print(bold("Prompt"))
+    print((rec.get("prompt", "") or dim("(none)")).strip())
+    print()
+    if rec.get("reply_summary"):
+        print(bold("Reply summary"))
+        print(rec["reply_summary"].strip())
+        print()
+    if rec.get("reply_path"):
+        print(dim(f"reply:  {rec['reply_path']}"))
+    if rec.get("task_path"):
+        print(dim(f"task:   {rec['task_path']}"))
+    log = LOGS / f"{rec['route_id']}.out.log"
+    if log.exists():
+        print(dim(f"log:    {log}  (ctx log {args[0]})"))
+    return 0
+
+
+def cmd_log(args: list[str]) -> int:
+    if not args:
+        print(red("usage: ctx log <id|N> [--tail N]"), file=sys.stderr)
+        return 2
+    tasks = collect_tasks()
+    rec = resolve_task(args[0], tasks)
+    if not rec:
+        print(red(f"no task matching '{args[0]}'"), file=sys.stderr)
+        return 1
+    log = LOGS / f"{rec['route_id']}.out.log"
+    if not log.exists():
+        print(dim(f"(no per-route log at {log}; route may still be running)"))
+        return 1
+    tail = 120
+    if "--tail" in args:
+        try:
+            tail = int(args[args.index("--tail") + 1])
+        except (ValueError, IndexError):
+            pass
+    lines = log.read_text(errors="replace").splitlines()
+    print(bold(f"{rec['route_id']} — last {min(tail, len(lines))} lines\n"))
+    print("\n".join(lines[-tail:]))
+    return 0
+
+
+def cmd_watch(args: list[str]) -> int:
+    if not LAUNCHD_LOG.exists():
+        print(red("no launchd log to watch"), file=sys.stderr)
+        return 1
+    print(dim(f"tailing {LAUNCHD_LOG}  (ctrl-c to stop)\n"))
+    try:
+        subprocess.run(["tail", "-f", str(LAUNCHD_LOG)])
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+HELP = """ctx — 花果山 / Huaguoshan local Context Engine
+
+  ctx                 status dashboard (default)
+  ctx status [N]      same dashboard; N tasks shown
+  ctx tasks [N|-a]    list tasks, latest first
+  ctx show <id|N>     task envelope + reply + summary
+  ctx log <id|N>      executor stdout log for a route (--tail N)
+  ctx watch           live-tail the worker loop log
+  ctx help            this help
+"""
+
+
+def main(argv: list[str]) -> int:
+    if not argv:
+        return cmd_status([])
+    cmd, rest = argv[0], argv[1:]
+    if cmd in ("status", "st"):
+        return cmd_status(rest)
+    if cmd in ("tasks", "ls", "list"):
+        return cmd_tasks(rest)
+    if cmd in ("show", "inspect", "cat"):
+        return cmd_show(rest)
+    if cmd in ("log", "stdout"):
+        return cmd_log(rest)
+    if cmd == "watch":
+        return cmd_watch(rest)
+    if cmd in ("help", "-h", "--help"):
+        print(HELP)
+        return 0
+    # unknown -> treat as `show <ref>` if it looks like a route, else status
+    if cmd.isdigit() or cmd.startswith("route_"):
+        return cmd_show([cmd] + rest)
+    print(red(f"unknown command: {cmd}"), file=sys.stderr)
+    print(HELP)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
