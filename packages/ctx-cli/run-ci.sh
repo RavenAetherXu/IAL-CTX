@@ -16,6 +16,9 @@ fail() {
 
 printf 'CTX ctx-cli CI\n'
 
+python3 -c 'import os; os.makedirs(os.path.abspath("/tmp"), exist_ok=True)'
+pass "test temp root"
+
 while IFS= read -r -d '' script; do
   python3 -m py_compile "$script"
 done < <(find bin -maxdepth 1 -type f ! -name '*.cmd' -print0 | sort -z)
