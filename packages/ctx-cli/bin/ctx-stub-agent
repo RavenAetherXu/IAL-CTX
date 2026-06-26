@@ -19,7 +19,7 @@ AGENT_KEY = os.environ.get("CTX_AGENT_KEY", f"{DEVICE_ID}/stub-executor")
 AGENT_ID = os.environ.get("CTX_AGENT_ID", f"{DEVICE_ID}:stub-executor")
 INSTANCE_ID = os.environ.get("CTX_AGENT_INSTANCE_ID", f"{DEVICE_ID}:{os.getpid()}")
 ROUTE_CMD = os.environ.get("CTX_ROUTE", "ctx-route")
-CAPABILITIES = ["runtime.stub", "runtime.shell", "probe.read-only", "ctx.route"]
+CAPABILITIES = ["runtime.stub", "ctx.route"]
 ALLOWED_CONSTRAINTS = {"read_only_first", "no_secrets"}
 
 

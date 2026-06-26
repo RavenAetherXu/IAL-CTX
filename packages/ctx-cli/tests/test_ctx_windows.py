@@ -155,6 +155,12 @@ class WindowsExtensionTests(unittest.TestCase):
             self.assertEqual(route["reply"]["executed_by"], "demo-local:stub")
             self.assertEqual(route["reply"]["evidence"][0]["kind"], "ctx-stub-result")
 
+    def test_ctx_stub_agent_only_advertises_stub_capability(self):
+        module = load_script(CTX_STUB_AGENT, "ctx_stub_agent_under_test")
+        self.assertEqual(module.agent_profile()["capabilities"], ["runtime.stub", "ctx.route"])
+        self.assertNotIn("runtime.shell", module.agent_profile()["capabilities"])
+        self.assertNotIn("probe.read-only", module.agent_profile()["capabilities"])
+
     def test_ctx_codex_run_writes_result_with_stub_codex(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp) / "ctx"
