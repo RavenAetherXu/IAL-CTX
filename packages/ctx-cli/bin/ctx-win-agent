@@ -46,6 +46,13 @@ def local_codex_cmd() -> list[str]:
     return parts
 
 
+def profile_transports() -> list[str]:
+    explicit = os.environ.get("CTX_TRANSPORT", "").strip()
+    if explicit:
+        return [item.strip() for item in explicit.split(",") if item.strip()]
+    return ["transport.local"] if not REMOTE else ["frp-reverse-ssh:example.invalid"]
+
+
 def route_json(args: list[str], input_obj: dict | None = None) -> object:
     data = json.dumps(input_obj, ensure_ascii=False) if input_obj is not None else None
     if REMOTE:
@@ -68,7 +75,7 @@ def device_profile() -> dict:
         "availability": "intermittent",
         "agents": ["local-codex-executor"],
         "capabilities": CAPABILITIES,
-        "transports": ["transport.local"] if not REMOTE else ["frp-reverse-ssh:example.invalid"],
+        "transports": profile_transports(),
         "last_seen": now(),
         "health": "up",
         "red_lines": ["metadata_first", "no_secret_values", "no_admin_without_approval"],
@@ -85,7 +92,7 @@ def agent_profile() -> dict:
         "kind": "executor",
         "capabilities": CAPABILITIES,
         "constraints_supported": sorted(ALLOWED_CONSTRAINTS),
-        "transports": ["transport.local"] if not REMOTE else ["frp-reverse-ssh:example.invalid"],
+        "transports": profile_transports(),
         "availability": "intermittent",
         "audit_profile": {
             "result_link_kind": "ctx-codex-result",
@@ -247,6 +254,50 @@ def cmd_execute(args: argparse.Namespace) -> int:
     return 0
 
 
+def add_optional_create_arg(parts: list[str], flag: str, value: str | None) -> None:
+    if value:
+        parts.extend([flag, value])
+
+
+def cmd_publish(args: argparse.Namespace) -> int:
+    create_args = [
+        "create",
+        "--created-by",
+        args.created_by or AGENT_ID,
+        "--origin-site",
+        args.origin_site or DEVICE_ID,
+        "--origin-agent",
+        args.origin_agent or AGENT_ID,
+        "--target-site",
+        args.target_site,
+        "--title-original",
+        args.title_original,
+    ]
+    add_optional_create_arg(create_args, "--route-id", args.route_id)
+    add_optional_create_arg(create_args, "--trace-id", args.trace_id)
+    add_optional_create_arg(create_args, "--lane-id", args.lane_id)
+    add_optional_create_arg(create_args, "--work-chat-id", args.work_chat_id)
+    add_optional_create_arg(create_args, "--context-id", args.context_id)
+    add_optional_create_arg(create_args, "--target-agent", args.target_agent)
+    add_optional_create_arg(create_args, "--task-kind", args.task_kind)
+    add_optional_create_arg(create_args, "--title-auto", args.title_auto)
+    add_optional_create_arg(create_args, "--reply-to", args.reply_to)
+    add_optional_create_arg(create_args, "--artifact-expected", args.artifact_expected)
+    add_optional_create_arg(create_args, "--probe", args.probe)
+    add_optional_create_arg(create_args, "--cwd", args.cwd)
+    add_optional_create_arg(create_args, "--instructions", args.instructions)
+    for capability in args.capability or []:
+        create_args.extend(["--capability", capability])
+    for constraint in args.constraint or []:
+        create_args.extend(["--constraint", constraint])
+    if args.approval_required:
+        create_args.append("--approval-required")
+    for secret_capability in args.secret_capability or []:
+        create_args.extend(["--secret-capability", secret_capability])
+    print(json.dumps(route_json(create_args), ensure_ascii=False))
+    return 0
+
+
 def cmd_reply(_args: argparse.Namespace) -> int:
     raise SystemExit("reply is performed by execute/once after ctx-codex returns")
 
@@ -269,6 +320,30 @@ def main() -> int:
     execute = sub.add_parser("execute")
     execute.add_argument("route_id")
     execute.set_defaults(func=cmd_execute)
+    publish = sub.add_parser("publish")
+    publish.add_argument("--route-id")
+    publish.add_argument("--trace-id")
+    publish.add_argument("--lane-id")
+    publish.add_argument("--work-chat-id")
+    publish.add_argument("--context-id")
+    publish.add_argument("--created-by")
+    publish.add_argument("--origin-site")
+    publish.add_argument("--origin-agent")
+    publish.add_argument("--target-site", required=True)
+    publish.add_argument("--target-agent")
+    publish.add_argument("--task-kind", default="inspect")
+    publish.add_argument("--title-original", required=True)
+    publish.add_argument("--title-auto")
+    publish.add_argument("--capability", action="append")
+    publish.add_argument("--constraint", action="append")
+    publish.add_argument("--approval-required", action="store_true")
+    publish.add_argument("--secret-capability", action="append")
+    publish.add_argument("--reply-to")
+    publish.add_argument("--artifact-expected")
+    publish.add_argument("--probe")
+    publish.add_argument("--cwd")
+    publish.add_argument("--instructions")
+    publish.set_defaults(func=cmd_publish)
     sub.add_parser("reply").set_defaults(func=cmd_reply)
     sub.add_parser("once").set_defaults(func=cmd_once)
     args = parser.parse_args()

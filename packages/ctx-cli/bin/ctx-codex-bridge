@@ -60,7 +60,7 @@ def redact(value: str, limit: int = 2000) -> str:
 
 
 def safe_record_id(value: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.:-]+", "_", value).strip("._") or "unknown"
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._") or "unknown"
 
 
 def default_task_id(task: str) -> str:

@@ -77,7 +77,21 @@ ctx-route --help
 That is the whole installation: clone, set `CTX_BASE`, run `ctx-route`. State
 is created lazily on first use.
 
-### 60-second tour (verified end-to-end)
+### No-engine lifecycle demo
+
+Run a complete create -> register -> claim -> execute -> reply loop without
+Codex, Kimi, or any other external AI CLI:
+
+```sh
+ctx-stub-agent demo --route-id route_stub_demo
+ctx-route show route_stub_demo
+```
+
+`ctx-stub-agent` is a neutral reference executor. It proves the CTX route
+lifecycle and gives adapter authors a small contract example; it does not do
+semantic task work.
+
+### Manual route tour
 
 ```sh
 # 1. Register an executor agent (any engine; here a Codex executor).
@@ -112,7 +126,7 @@ ctx-route routes
 ctx-route agent-match <route_id>
 
 # 4. An executor adapter then claims -> executes -> replies; you verify.
-#    (see "Executor adapters" below for the four-verb contract)
+#    (see "Executor adapters" below for the adapter contract)
 ctx-route doctor          # health, diagnostics
 ```
 
@@ -125,7 +139,9 @@ bash packages/ctx-cli/run-ci.sh
 ## Connecting a real engine (e.g. Codex)
 
 CTX core only coordinates and records. To make routes actually execute, you run
-an **executor adapter** next to your engine.
+an **executor adapter** next to your engine. The bundled `ctx-stub-agent` is the
+zero-dependency reference adapter; real engines such as Codex, Kimi CLI, or any
+other local CLI use the same register/claim/execute/reply shape.
 
 A neutral, cross-platform reference Codex bridge is now **included** as
 `packages/ctx-cli/bin/ctx-codex-bridge`: it runs your local `codex exec`, redacts
@@ -184,14 +200,16 @@ embed, require, or privilege any execution engine. `ctx-codex` and `codex-cli`
 are external executor adapters supplied by an operator and injected through
 `CTX_CODEX`; other engines use the same registration and routing contract.
 
-The executor contract has four verbs:
+The executor adapter contract is:
 
 1. `register`: publish a `ctx-agent-profile-v1` with identity, kind,
    capabilities, transport, constraints, and audit profile.
-2. `claim`: claim an eligible route by device, agent, and optional instance.
-3. `execute`: run the local engine under the route's constraints without
+2. `publish`: create origin-attributed routes in a local or hub ledger when the
+   adapter is also used as an origin-side client.
+3. `claim`: claim an eligible route by device, agent, and optional instance.
+4. `execute`: run the local engine under the route's constraints without
    exposing secret values.
-4. `reply`: write structured evidence, artifacts, residual risk, and next
+5. `reply`: write structured evidence, artifacts, residual risk, and next
    action back to the route ledger.
 
 Example external Codex adapter profile:

@@ -7,6 +7,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -14,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CTX_ROUTE = ROOT / "bin" / "ctx-route"
 CTX_CODEX = ROOT / "bin" / "ctx-codex-bridge"
 CTX_WIN_AGENT = ROOT / "bin" / "ctx-win-agent"
+CTX_STUB_AGENT = ROOT / "bin" / "ctx-stub-agent"
 
 
 def load_script(path, name):
@@ -72,6 +74,87 @@ class WindowsExtensionTests(unittest.TestCase):
         route["required_capabilities"] = ["os.macos"]
         self.assertFalse(module.route_eligible(route))
 
+    def test_ctx_win_agent_remote_transport_can_be_injected(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "CTX_REMOTE": "ctx-ledger@example.invalid",
+                "CTX_TRANSPORT": "frp-reverse-ssh:127.0.0.1:6023",
+            },
+        ):
+            module = load_script(CTX_WIN_AGENT, "ctx_win_agent_remote_under_test")
+            self.assertEqual(module.device_profile()["transports"], ["frp-reverse-ssh:127.0.0.1:6023"])
+            self.assertEqual(module.agent_profile()["transports"], ["frp-reverse-ssh:127.0.0.1:6023"])
+
+    def test_ctx_win_agent_publish_creates_windows_origin_route(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "ctx"
+            env = {
+                **os.environ,
+                "CTX_BASE": str(base),
+            }
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(CTX_WIN_AGENT),
+                    "publish",
+                    "--route-id",
+                    "route_from_windows",
+                    "--target-site",
+                    "lingxiaodian",
+                    "--target-agent",
+                    "codex",
+                    "--title-original",
+                    "Windows origin route",
+                    "--capability",
+                    "os.linux,runtime.codex",
+                    "--constraint",
+                    "read_only_first,no_secrets",
+                    "--instructions",
+                    "Return a metadata-first status.",
+                ],
+                text=True,
+                capture_output=True,
+                env=env,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+            created = json.loads(result.stdout)
+            route = json.loads(self.run_route(base, "show", "route_from_windows").stdout)
+            self.assertEqual(created["route_id"], "route_from_windows")
+            self.assertEqual(route["origin_site"], "windows-local")
+            self.assertEqual(route["origin_agent"], "windows-local:codex-local")
+            self.assertEqual(route["target_site"], "lingxiaodian")
+            self.assertEqual(route["target_agent"], "codex")
+
+    def test_ctx_stub_agent_demo_closes_route_without_external_cli(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "ctx"
+            env = {
+                **os.environ,
+                "CTX_BASE": str(base),
+                "CTX_DEVICE_ID": "demo-local",
+                "CTX_AGENT_ID": "demo-local:stub",
+            }
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(CTX_STUB_AGENT),
+                    "demo",
+                    "--route-id",
+                    "route_stub_demo_test",
+                ],
+                text=True,
+                capture_output=True,
+                env=env,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+            payload = json.loads(result.stdout)
+            route = json.loads(self.run_route(base, "show", "route_stub_demo_test").stdout)
+            self.assertEqual(payload["route_id"], "route_stub_demo_test")
+            self.assertEqual(route["status"], "replied")
+            self.assertEqual(route["reply"]["executed_by"], "demo-local:stub")
+            self.assertEqual(route["reply"]["evidence"][0]["kind"], "ctx-stub-result")
+
     def test_ctx_codex_run_writes_result_with_stub_codex(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp) / "ctx"
@@ -94,16 +177,17 @@ class WindowsExtensionTests(unittest.TestCase):
                 "CODEX_CMD": f"{sys.executable} {stub}",
             }
             result = subprocess.run(
-                [sys.executable, str(CTX_CODEX), "run", "--task", "hello", "--task-id", "task_stub"],
+                [sys.executable, str(CTX_CODEX), "run", "--task", "hello", "--task-id", "task:stub"],
                 text=True,
                 capture_output=True,
                 env=env,
             )
             self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
             payload = json.loads(result.stdout)
+            self.assertNotIn(":", Path(payload["result_path"]).name)
             record = json.loads(Path(payload["result_path"]).read_text(encoding="utf-8"))
             self.assertEqual(record["kind"], "ctx-codex-result")
-            self.assertEqual(record["task_id"], "task_stub")
+            self.assertEqual(record["task_id"], "task:stub")
             self.assertEqual(record["status"], "replied")
 
     def test_ctx_win_agent_once_closes_local_route_with_stub_codex(self):

@@ -6,7 +6,15 @@ on:
 
 jobs:
   ctx-cli:
-    runs-on: ubuntu-latest
+    name: ctx-cli (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -15,4 +23,5 @@ jobs:
       - name: Run ctx-cli CI
         env:
           CTX_CI_SKIP_RUNTIME_SHA: "1"
+        shell: bash
         run: bash packages/ctx-cli/run-ci.sh

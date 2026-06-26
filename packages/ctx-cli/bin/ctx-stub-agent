@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+"""Zero-dependency CTX executor adapter for demos and adapter authors."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import shlex
+import socket
+import subprocess
+import sys
+from pathlib import Path
+
+
+DEVICE_ID = os.environ.get("CTX_DEVICE_ID", "ctx-demo-local")
+AGENT_KEY = os.environ.get("CTX_AGENT_KEY", f"{DEVICE_ID}/stub-executor")
+AGENT_ID = os.environ.get("CTX_AGENT_ID", f"{DEVICE_ID}:stub-executor")
+INSTANCE_ID = os.environ.get("CTX_AGENT_INSTANCE_ID", f"{DEVICE_ID}:{os.getpid()}")
+ROUTE_CMD = os.environ.get("CTX_ROUTE", "ctx-route")
+CAPABILITIES = ["runtime.stub", "runtime.shell", "probe.read-only", "ctx.route"]
+ALLOWED_CONSTRAINTS = {"read_only_first", "no_secrets"}
+
+
+def now() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def split_cmd(value: str) -> list[str]:
+    return shlex.split(value, posix=(os.name != "nt"))
+
+
+def route_cmd() -> list[str]:
+    parts = split_cmd(ROUTE_CMD)
+    if len(parts) == 1 and parts[0] == "ctx-route":
+        return [sys.executable, str(Path(__file__).resolve().with_name("ctx-route"))]
+    return parts
+
+
+def route_json(args: list[str], input_obj: dict | None = None) -> object:
+    data = json.dumps(input_obj, ensure_ascii=False) if input_obj is not None else None
+    result = subprocess.run([*route_cmd(), *args], input=data, text=True, capture_output=True, timeout=60)
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or "ctx-route command failed").strip())
+    out = (result.stdout or "").strip()
+    return json.loads(out) if out else None
+
+
+def device_profile() -> dict:
+    return {
+        "device_id": DEVICE_ID,
+        "site": DEVICE_ID,
+        "os": os.name,
+        "availability": "demo",
+        "agents": ["stub-executor"],
+        "capabilities": CAPABILITIES,
+        "transports": ["transport.local"],
+        "last_seen": now(),
+        "health": "up",
+        "red_lines": ["metadata_first", "no_secret_values"],
+    }
+
+
+def agent_profile() -> dict:
+    return {
+        "schema": "ctx-agent-profile-v1",
+        "agent_key": AGENT_KEY,
+        "agent_id": AGENT_ID,
+        "device_id": DEVICE_ID,
+        "engine": {"name": "ctx-stub-agent", "version": "1.0.0", "model": "none"},
+        "kind": "executor",
+        "capabilities": CAPABILITIES,
+        "constraints_supported": sorted(ALLOWED_CONSTRAINTS),
+        "transports": ["transport.local"],
+        "availability": "demo",
+        "audit_profile": {
+            "result_link_kind": "ctx-stub-result",
+            "expects_thread_id": False,
+            "ephemeral_session": True,
+        },
+        "secret_capabilities": [],
+        "registered_at": now(),
+        "red_lines": ["metadata_first", "no_secret_values"],
+    }
+
+
+def register() -> dict:
+    route_json(["device-upsert", "--profile-file", "-"], device_profile())
+    registered = route_json(["agent-register", "--profile-file", "-"], agent_profile())
+    route_json([
+        "agent-heartbeat",
+        "--device-id",
+        DEVICE_ID,
+        "--agent-id",
+        AGENT_ID,
+        "--instance-id",
+        INSTANCE_ID,
+        "--pid",
+        str(os.getpid()),
+        "--hostname",
+        socket.gethostname(),
+        "--started-at",
+        now(),
+        "--role",
+        "stub-demo",
+    ])
+    return registered
+
+
+def route_eligible(route: dict) -> bool:
+    if route.get("target_site") != DEVICE_ID:
+        return False
+    if route.get("status") != "queued":
+        return False
+    if not set(route.get("required_capabilities") or []).issubset(set(CAPABILITIES)):
+        return False
+    if not set(route.get("constraints") or []).issubset(ALLOWED_CONSTRAINTS):
+        return False
+    if route.get("approval_required"):
+        return False
+    if route.get("secret_capabilities") or []:
+        return False
+    return True
+
+
+def queued_routes() -> list[dict]:
+    rows = route_json(["list", "--status", "queued", "--target-site", DEVICE_ID, "--json"])
+    return rows if isinstance(rows, list) else []
+
+
+def claim_one() -> dict | None:
+    register()
+    for route in queued_routes():
+        if not route_eligible(route):
+            continue
+        try:
+            claim = route_json([
+                "claim",
+                route["route_id"],
+                "--device-id",
+                DEVICE_ID,
+                "--agent-id",
+                AGENT_ID,
+                "--instance-id",
+                INSTANCE_ID,
+                "--lease-seconds",
+                "600",
+            ])
+            if isinstance(claim, dict):
+                claim["route"] = route
+            return claim
+        except RuntimeError as exc:
+            if "route not claimable:" in str(exc) or "status=" in str(exc):
+                continue
+            raise
+    return None
+
+
+def execute_claim(claim: dict) -> dict:
+    route = claim.get("route") if isinstance(claim.get("route"), dict) else route_json(["show", claim["route_id"]])
+    rid = str(route["route_id"])
+    lease_id = str(claim.get("lease_id") or "")
+    start_args = ["start", rid, "--agent-id", AGENT_ID, "--instance-id", INSTANCE_ID]
+    if lease_id:
+        start_args.extend(["--lease-id", lease_id])
+    route_json(start_args)
+    instruction_text = str(route.get("instructions") or "")
+    reply = {
+        "route_id": rid,
+        "status": "replied",
+        "replied_at": now(),
+        "executed_by": AGENT_ID,
+        "summary": "ctx-stub-agent closed this route without any external AI CLI.",
+        "evidence": [{
+            "kind": "ctx-stub-result",
+            "route_id": rid,
+            "title": str(route.get("title_original") or route.get("title_auto") or rid),
+            "instruction_chars": len(instruction_text),
+        }],
+        "artifacts": [],
+        "secret_events": [],
+        "residual_risk": "Stub executor proves CTX lifecycle only; it does not perform semantic task work.",
+        "next_action": "verify",
+    }
+    reply_args = ["reply", rid, "--reply-file", "-", "--agent-id", AGENT_ID, "--instance-id", INSTANCE_ID]
+    if lease_id:
+        reply_args.extend(["--lease-id", lease_id])
+    route_json(reply_args, reply)
+    return reply
+
+
+def create_demo_route(args: argparse.Namespace) -> dict:
+    create_args = [
+        "create",
+        "--created-by",
+        AGENT_ID,
+        "--origin-site",
+        DEVICE_ID,
+        "--origin-agent",
+        AGENT_ID,
+        "--target-site",
+        DEVICE_ID,
+        "--target-agent",
+        AGENT_ID,
+        "--title-original",
+        args.title,
+        "--capability",
+        "runtime.stub,ctx.route",
+        "--constraint",
+        "read_only_first,no_secrets",
+        "--instructions",
+        args.instructions,
+    ]
+    if args.route_id:
+        create_args.extend(["--route-id", args.route_id])
+    return route_json(create_args)
+
+
+def cmd_register(_args: argparse.Namespace) -> int:
+    print(json.dumps(register(), ensure_ascii=False))
+    return 0
+
+
+def cmd_claim(_args: argparse.Namespace) -> int:
+    claim = claim_one()
+    print(json.dumps(claim or {"claimed": None}, ensure_ascii=False))
+    return 0
+
+
+def cmd_execute(args: argparse.Namespace) -> int:
+    route = route_json(["show", args.route_id])
+    if not isinstance(route, dict):
+        raise RuntimeError("route not found")
+    if route.get("status") == "queued":
+        claim = route_json([
+            "claim",
+            args.route_id,
+            "--device-id",
+            DEVICE_ID,
+            "--agent-id",
+            AGENT_ID,
+            "--instance-id",
+            INSTANCE_ID,
+            "--lease-seconds",
+            "600",
+        ])
+        if isinstance(claim, dict):
+            claim["route"] = route
+    else:
+        claim = {"route_id": args.route_id, "route": route, "lease_id": (route.get("lease") or {}).get("lease_id")}
+    print(json.dumps(execute_claim(claim), ensure_ascii=False))
+    return 0
+
+
+def cmd_once(_args: argparse.Namespace) -> int:
+    claim = claim_one()
+    if not claim:
+        print(json.dumps({"processed": 0}, ensure_ascii=False))
+        return 0
+    reply = execute_claim(claim)
+    print(json.dumps({"processed": 1, "route_id": reply["route_id"], "status": reply["status"]}, ensure_ascii=False))
+    return 0
+
+
+def cmd_demo(args: argparse.Namespace) -> int:
+    register()
+    created = create_demo_route(args)
+    route_id = str(created["route_id"])
+    route = route_json(["show", route_id])
+    claim = route_json([
+        "claim",
+        route_id,
+        "--device-id",
+        DEVICE_ID,
+        "--agent-id",
+        AGENT_ID,
+        "--instance-id",
+        INSTANCE_ID,
+        "--lease-seconds",
+        "600",
+    ])
+    if isinstance(claim, dict):
+        claim["route"] = route
+    reply = execute_claim(claim)
+    shown = route_json(["show", route_id])
+    print(json.dumps({
+        "route_id": route_id,
+        "status": shown.get("status") if isinstance(shown, dict) else reply["status"],
+        "executed_by": reply["executed_by"],
+        "summary": reply["summary"],
+    }, ensure_ascii=False))
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="ctx-stub-agent")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("register").set_defaults(func=cmd_register)
+    sub.add_parser("claim").set_defaults(func=cmd_claim)
+    execute = sub.add_parser("execute")
+    execute.add_argument("route_id")
+    execute.set_defaults(func=cmd_execute)
+    sub.add_parser("once").set_defaults(func=cmd_once)
+    demo = sub.add_parser("demo")
+    demo.add_argument("--route-id")
+    demo.add_argument("--title", default="CTX stub lifecycle demo")
+    demo.add_argument("--instructions", default="Return a metadata-first stub reply.")
+    demo.set_defaults(func=cmd_demo)
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1306,7 +1306,7 @@ def claim_agent_profile_lease_fields(route: dict, device_id: str, agent_id: str,
 
 def safe_record_id(value: object) -> str:
     text = str(value or "unknown")
-    return re.sub(r"[^A-Za-z0-9_.:-]+", "_", text).strip("._") or "unknown"
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", text).strip("._") or "unknown"
 
 
 def iter_routes() -> list[tuple[Path, dict]]:

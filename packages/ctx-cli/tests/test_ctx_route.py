@@ -347,6 +347,24 @@ class CtxRouteTests(unittest.TestCase):
             route = json.loads(self.run_route(base, "show", "route_legacy").stdout)
             self.assertIsNone(route["lease"]["claim_instance_id"])
 
+    def test_agent_instance_filename_is_windows_safe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            self.run_route(
+                base,
+                "agent-heartbeat",
+                "--device-id",
+                "lingxiaodian",
+                "--agent-id",
+                "lingxiaodian:codex",
+                "--instance-id",
+                "instance:windows",
+            )
+            paths = list((base / "devices" / "agent-instances").glob("*.json"))
+            self.assertEqual(len(paths), 1)
+            self.assertNotIn(":", paths[0].name)
+            self.assertIn("lingxiaodian_codex", paths[0].name)
+
     def test_claim_rejects_agent_process_with_stale_loaded_code(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

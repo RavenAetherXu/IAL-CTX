@@ -78,14 +78,22 @@ python bin\ctx-win-agent once
 python bin\ctx-route show route_windows_local_codex
 ```
 
-For a no-Codex local drill, point `CTX_CODEX` to a local stub that implements
-`run --task --task-id`, writes `CTX_BASE\done\<task_id>.json`, and prints JSON
-with `status="replied"` and `result_path`.
+For a no-Codex local lifecycle drill, use the bundled neutral stub executor:
+
+```powershell
+python bin\ctx-stub-agent demo --route-id route_windows_stub_demo
+python bin\ctx-route show route_windows_stub_demo
+```
+
+The stub proves register -> claim -> execute -> reply without requiring Codex,
+Kimi, or any other external AI CLI. It is intentionally not a semantic task
+worker.
 
 ## M1 Spoke Framework
 
 M1 connects the Windows spoke to a hub ledger. The hub remains the authority;
-Windows only claims eligible routes and replies with metadata-first results.
+Windows can publish routes to the hub, claim eligible routes targeted at
+Windows, and reply with metadata-first results.
 
 Operator red-line steps, performed outside this repository:
 
@@ -100,14 +108,32 @@ environment on Windows:
 
 ```powershell
 $env:CTX_REMOTE = "ctx-ledger@example.invalid"
-$env:CTX_ROUTE = "ctx-route"
+$env:CTX_ROUTE = "<hub-side ctx-route command>"
+$env:CTX_TRANSPORT = "frp-reverse-ssh:127.0.0.1:<hub-local-port>"
 $env:CTX_DEVICE_ID = "windows-local"
 python bin\ctx-win-agent register
 python bin\ctx-win-agent once
 ```
 
 `example.invalid` is a placeholder. Replace it only in the operator's local
-environment or secret-managed deployment config, not in git.
+environment or secret-managed deployment config, not in git. `CTX_TRANSPORT`
+is audit metadata for profiles and replies; set it to the hub-local reverse
+endpoint that the operator has already approved.
+
+Publish a Windows-origin route to another hub device:
+
+```powershell
+python bin\ctx-win-agent publish `
+  --target-site lingxiaodian `
+  --target-agent codex `
+  --title-original "Windows asks VPS for CTX status" `
+  --capability os.linux,runtime.codex `
+  --constraint read_only_first,no_secrets `
+  --instructions "Inspect CTX status and reply with metadata-first evidence."
+```
+
+Run `python bin\ctx-win-agent once` when Windows should claim routes targeted
+at `windows-local`.
 
 ## M1.5 Codex Runtime Injection
 

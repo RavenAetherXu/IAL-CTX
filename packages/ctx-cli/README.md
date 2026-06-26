@@ -9,11 +9,15 @@ Source-of-truth home for lightweight CTX CLI helpers.
 Current helpers:
 
 - `bin/ctx-route` - file-backed L2 route lifecycle helper.
+- `bin/ctx-stub-agent` - zero-dependency neutral executor used for demos and
+  adapter authoring. It registers, claims, starts, and replies without any AI
+  CLI.
 - `bin/ctx-codex-bridge` - neutral, cross-platform reference Codex bridge. Runs your
   local `codex exec`, redacts secret-shaped output, writes a `ctx-codex-result`;
   never reads Codex state, sessions, or secrets. Injected via `CTX_CODEX`.
 - `bin/ctx-win-agent` - Windows/portable executor adapter
-  (`register/claim/execute/reply/once`). See `docs/WINDOWS-DEPLOYMENT.md`.
+  (`register/publish/claim/execute/reply/once`). See
+  `docs/WINDOWS-DEPLOYMENT.md`.
 - `bin/ctx-lingxiao-agent` - manual-first Lingxiaodian local agent that claims
   safe `target_site=lingxiaodian` routes and invokes the Codex bridge via
   `CTX_CODEX` (default `ctx-codex-bridge`).
@@ -69,11 +73,16 @@ Adapter contract:
 
 1. `register`: publish a `ctx-agent-profile-v1` profile with `kind=executor`,
    capabilities, constraints, transports, and audit fields.
-2. `claim`: claim an eligible route by device, agent, and optional instance.
-3. `execute`: run local work under the route constraints without reading or
+2. `publish`: create origin-attributed routes in the hub ledger.
+3. `claim`: claim an eligible route by device, agent, and optional instance.
+4. `execute`: run local work under the route constraints without reading or
    printing secret values.
-4. `reply`: write structured route evidence, artifacts, residual risk, and
+5. `reply`: write structured route evidence, artifacts, residual risk, and
    next action.
+
+Remote spokes can publish operator-provided transport metadata with
+`CTX_TRANSPORT`, for example a hub-local FRP reverse SSH endpoint. This is audit
+metadata only; authorization still comes from the SSH identity and hub policy.
 
 Example external Codex profile:
 
