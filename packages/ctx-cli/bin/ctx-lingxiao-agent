@@ -326,9 +326,12 @@ def agent_retire() -> object:
 def safe_cwd(route: dict) -> str:
     requested = route.get("cwd") or DEFAULT_WORKDIR
     path = os.path.abspath(str(requested))
-    if any(part in path for part in BLOCKED_CWD_PARTS):
+    path_for_match = path.replace("\\", "/")
+    if any(part in path_for_match for part in BLOCKED_CWD_PARTS):
         raise ValueError(f"blocked cwd: {path}")
-    if not any(path == prefix or path.startswith(prefix + "/") for prefix in ALLOWED_CWD_PREFIXES):
+    path_cmp = os.path.normcase(path)
+    allowed_prefixes = tuple(os.path.normcase(os.path.abspath(prefix)) for prefix in ALLOWED_CWD_PREFIXES)
+    if not any(path_cmp == prefix or path_cmp.startswith(prefix + os.sep) for prefix in allowed_prefixes):
         raise ValueError(f"cwd outside allowed prefixes: {path}")
     if not os.path.isdir(path):
         raise ValueError(f"cwd does not exist: {path}")
